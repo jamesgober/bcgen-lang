@@ -1,6 +1,8 @@
 //! End to end: a small Mox program, lowered by hand into HIR the way a
-//! lowering emits it (names unresolved), resolved by resolve-lang, compiled
-//! by bcgen-lang, and run on bvm-lang, printing through a host function.
+//! lowering emits it (names unresolved), resolved by a small lexical
+//! resolver in the test (resolve-lang 0.3 is built on hir-lang 0.3, so it
+//! cannot resolve this unit), compiled by bcgen-lang, and run on bvm-lang,
+//! printing through a host function.
 //!
 //! The Mox source it stands for:
 //!
@@ -39,9 +41,8 @@ use bvm_lang::{Program, Value, Vm};
 use common::hb::H;
 use hir_lang::{
     Arm, Binder, BinderKind, Capture, CaptureMode, Closure, DefaultEval, Effects, Expr, ExprId,
-    Lit, Name, Ns, OpKind, ParamKind, Pat, Res, Span, UnitId,
+    Lit, Ns, OpKind, ParamKind, Pat, Res, Span,
 };
-use resolve_lang::{DefKind, Export, MapEnv, Namespace, Policy, Resolver};
 
 /// A reference by name, left for the resolver.
 fn name(h: &mut H, s: &str) -> ExprId {
@@ -99,6 +100,46 @@ fn foreach(
     let lp = h.loop_(None, m, None);
     let outer = h.block(&[lit], Some(lp));
     h.stmt(outer)
+}
+
+/// Resolves every unresolved one-segment path: to the innermost local of
+/// that name in scope, else to a root-level function of that name, else to
+/// the host function of that name (what resolve-lang's `php` preset does for
+/// this program).
+fn resolve_by_hand(hir: &mut hir_lang::Hir, names: &intern_lang::Interner) {
+    let root = hir.root();
+    let items: Vec<(String, hir_lang::ItemId)> = match hir.item(root).kind {
+        hir_lang::ItemKind::Module { items, .. } => hir
+            .list(items)
+            .iter()
+            .filter_map(|&i| {
+                let n = hir.item(i).name?;
+                Some((names.resolve(n.sym).unwrap_or("").to_string(), i))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for i in 0..hir.count(hir_lang::IdKind::Path) {
+        let Some(p) = hir_lang::PathId::from_index(i) else {
+            continue;
+        };
+        let path = *hir.path(p);
+        if path.res != Res::Unresolved {
+            continue;
+        }
+        let Some(seg) = hir.list(path.segments).first().copied() else {
+            continue;
+        };
+        let text = names.resolve(seg.name.sym).unwrap_or("").to_string();
+        let res = match hir.lookup_local(p, seg.name) {
+            Some(b) => Res::Local(b),
+            None => match items.iter().find(|(n, _)| *n == text) {
+                Some(&(_, item)) => Res::Def(hir.def(hir_lang::Def::Item(item))),
+                None => Res::Extern(seg.name.sym),
+            },
+        };
+        hir.resolve(p, res).expect("resolves");
+    }
 }
 
 fn program() -> (hir_lang::Hir, intern_lang::Interner) {
@@ -297,20 +338,8 @@ fn program() -> (hir_lang::Hir, intern_lang::Interner) {
 
 #[test]
 fn a_mox_program_runs_end_to_end() {
-    let (hir, mut names) = program();
-    let echo = Name::new(names.intern("echo"));
-    let env = MapEnv::new().with_prelude(
-        echo,
-        Namespace::Value,
-        Export::new(Res::Extern(echo.sym), DefKind::Extern),
-    );
-    let res = Resolver::new(Policy::new())
-        .with_env(&env)
-        .resolve(hir, &names)
-        .expect("resolves");
-    assert!(res.is_clean(), "{:?}", res.diagnostics());
-    let hir = res.hir(UnitId::new(0)).expect("unit").clone();
-
+    let (mut hir, names) = program();
+    resolve_by_hand(&mut hir, &names);
     let lines = LineIndex::new("main.mox", 0, "");
     let out = Compiler::new(Options::new())
         .with_locator(&lines)

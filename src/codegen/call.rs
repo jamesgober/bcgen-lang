@@ -1,35 +1,51 @@
 //! Calls.
 //!
-//! **The calling convention.** A function item compiles to a direct-call
-//! function taking each parameter in a register (`dyn`, or a cell for a
-//! by-reference parameter) plus an `i64` presence mask when a parameter has
-//! a default; a call of a known function arranges its arguments at compile
-//! time and `call`s it with a window (LSB §1.3). Every function *value*
-//! (closures, function items used as values) takes one convention instead:
-//! an argument packet `(positional: map, named: map or nil)`, unpacked by
-//! the callee's prologue, so a dynamic call (`dcall`, whose arity LSB checks
-//! exactly) works whatever the callee's parameters are. Host functions take
-//! their arguments positionally (`call_import`).
+//! **The calling convention.** A function item or closure compiles to one
+//! LSB function whose signature is each parameter in a register (`dyn`, or a
+//! reference for a by-reference parameter) plus an `i64` presence mask when
+//! a parameter has a default, and which carries its **parameter list** (LSB
+//! §5.15). A call of a known function arranges its arguments at compile
+//! time, by the same binding rules, and `call`s it with a window; every
+//! other call (a function value, a method, a known function given spreads or
+//! arguments that do not bind) is a dynamic call, `dcall` or `dcall_shape`
+//! with a call shape, which the VM binds through the callee's list, raising
+//! `ArgumentError` (E0114) when they do not bind. Host functions take their
+//! arguments positionally (`call_import`).
+//!
+//! A place argument (PHP `f($a['k'])`) gives a by-reference parameter a
+//! reference to the place: decided at compile time for a known callee, and
+//! at run time with `dparam_ref` for a dynamic one, the place's operands
+//! evaluated once either way.
 
 use alloc::vec::Vec;
 
-use bytecode_lang::{FuncId, ImportId, Inst, Kind, Label, Reg, ValType};
-use hir_lang::{Arg, ArgKind, ExprId, ItemKind, List, NodeRef, Res, Symbol};
+use bytecode_lang::{ArgKind as LArgKind, CallShape, FuncId, ImportId, Inst, Reg, ValType};
+use hir_lang::{Arg, ArgKind, ExprId, ItemKind, List, NodeRef, ParamKind, Res, Symbol};
 use intern_lang::Lookup;
 
+use super::place::PlaceStep;
 use super::{Dst, Gen, Rel, Step, Task, Val};
 use crate::error::{CompileError, Unsupported};
 use crate::func::FnCx;
-use crate::unit::{PInfo, Slot};
+use crate::unit::{MAX_ARITY, PInfo};
 
-/// How a packet call reaches its callee.
+/// What a direct call runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Via {
-    /// Through a function value on the value stack (`dcall`); `recv` when a
-    /// method's receiver lies below it.
-    Value { recv: bool },
-    /// Directly to a function item's dynamic entry.
-    Direct(FuncId),
+pub(crate) enum Direct {
+    /// The function (`call`).
+    Call(FuncId),
+    /// A generator's coroutine body (`coro_new`): the call makes the
+    /// coroutine without running it.
+    Coro(FuncId),
+}
+
+/// Which parameter a place argument of a dynamic call may bind to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgAt {
+    /// The positional argument at this 0-based position.
+    Pos(i64),
+    /// The named argument of this name.
+    Name(Symbol),
 }
 
 /// The continuation steps of a call.
@@ -37,7 +53,7 @@ pub(crate) enum Via {
 pub(crate) enum CallStep {
     /// A direct call: the arguments are in the window.
     DirectFinish {
-        func: FuncId,
+        target: Direct,
         win: (u32, Reg),
         argc: u8,
         rest: Option<(Reg, usize)>,
@@ -53,25 +69,32 @@ pub(crate) enum CallStep {
         dst: Dst,
         node: NodeRef,
     },
-    /// The callee (and receiver) are evaluated: build the packet.
-    PacketBegin {
+    /// The callee (and, for a method, the receiver below it) is on the value
+    /// stack: allocate the window and evaluate the arguments into it.
+    ValueBegin {
         args: List<Arg>,
-        via: Via,
+        recv: bool,
         dst: Dst,
         node: NodeRef,
     },
-    /// The packet is built: call.
-    PacketFinish {
-        pos: Reg,
-        named: Option<Reg>,
-        via: Via,
+    /// The arguments are in the window: the dynamic call.
+    ValueFinish {
+        win: (u32, Reg),
+        kinds: Vec<LArgKind>,
+        recv: bool,
         dst: Dst,
         node: NodeRef,
     },
-    /// Pops a sequence and appends its values to the packet.
-    Spread { pos: Reg, node: NodeRef },
-    /// Pops a map and adds its string-keyed entries as named arguments.
-    SpreadNamed { named: Reg, node: NodeRef },
+    /// A place argument of a dynamic call, its operands evaluated into place
+    /// `idx`: a reference to it when the callee takes that argument by
+    /// reference, else its value.
+    PlaceArg {
+        idx: u32,
+        callee: Reg,
+        at: ArgAt,
+        slot: Reg,
+        node: NodeRef,
+    },
     /// Looks up a method on the receiver (on the stack) by name.
     Method { name: Symbol, node: NodeRef },
     /// Pops a method name and looks it up on the receiver below it.
@@ -81,43 +104,54 @@ pub(crate) enum CallStep {
 /// Where an argument of a direct call goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum To {
+    /// Parameter `n`.
     Param(usize),
+    /// The rest parameter, positionally (under the next integer key).
     Rest,
+    /// The rest parameter, under its name (PHP 8.1: no named rest).
+    RestNamedInRest(Symbol),
+    /// The named rest parameter, under its name.
     RestNamed(Symbol),
 }
 
-/// Matches arguments to parameters at compile time, by the rules the
-/// dynamic prologue applies at run time; `None` if they do not match (the
-/// call then goes through the packet, whose prologue raises the error).
+/// Matches arguments to parameters at compile time by LSB §5.15's binding
+/// rules (the ones the VM applies to a dynamic call); `None` if the call
+/// must bind at run time (a spread, a by-reference rest parameter) or does
+/// not bind (the VM then raises `ArgumentError` at the call).
 fn arrange(params: &[PInfo], args: &[Arg]) -> Option<(Vec<To>, u64)> {
     let mut filled = alloc::vec![false; params.len()];
     let positional: Vec<usize> = (0..params.len())
         .filter(|&i| params.get(i).is_some_and(PInfo::positional))
         .collect();
-    let rest = params.iter().any(|p| p.kind == hir_lang::ParamKind::Rest);
-    let rest_named = params
-        .iter()
-        .any(|p| p.kind == hir_lang::ParamKind::RestNamed);
+    let rest = params.iter().position(|p| p.kind == ParamKind::Rest);
+    let rest_named = params.iter().position(|p| p.kind == ParamKind::RestNamed);
+    if params.iter().any(|p| p.rest() && p.by_ref) {
+        return None;
+    }
     let mut next = 0usize;
+    let mut named_seen = false;
     let mut out = Vec::with_capacity(args.len());
     for a in args {
         match a.kind {
-            ArgKind::Positional => match positional.get(next) {
-                Some(&j) => {
-                    next += 1;
-                    // A named argument earlier in the list may have filled
-                    // it: the error the packet prologue raises.
-                    let f = filled.get_mut(j)?;
-                    if *f {
-                        return None;
-                    }
-                    *f = true;
-                    out.push(To::Param(j));
+            ArgKind::Positional => {
+                if named_seen {
+                    return None;
                 }
-                None if rest => out.push(To::Rest),
-                None => return None,
-            },
+                match positional.get(next) {
+                    Some(&j) => {
+                        next += 1;
+                        *filled.get_mut(j)? = true;
+                        out.push(To::Param(j));
+                    }
+                    None => {
+                        let r = rest?;
+                        *filled.get_mut(r)? = true;
+                        out.push(To::Rest);
+                    }
+                }
+            }
             ArgKind::Named(id) => {
+                named_seen = true;
                 match params
                     .iter()
                     .position(|p| p.nameable() && p.name == Some(id.sym))
@@ -130,8 +164,17 @@ fn arrange(params: &[PInfo], args: &[Arg]) -> Option<(Vec<To>, u64)> {
                         *f = true;
                         out.push(To::Param(j));
                     }
-                    None if rest_named => out.push(To::RestNamed(id.sym)),
-                    None => return None,
+                    None => match (rest_named, rest) {
+                        (Some(r), _) => {
+                            *filled.get_mut(r)? = true;
+                            out.push(To::RestNamed(id.sym));
+                        }
+                        (None, Some(r)) => {
+                            *filled.get_mut(r)? = true;
+                            out.push(To::RestNamedInRest(id.sym));
+                        }
+                        (None, None) => return None,
+                    },
                 }
             }
             ArgKind::Spread | ArgKind::SpreadNamed => return None,
@@ -196,9 +239,9 @@ impl<L: Lookup> Gen<'_, '_, L> {
         // A function value.
         self.sched([
             Task::Expr(callee, Dst::Temp),
-            Task::Step(Step::Call(CallStep::PacketBegin {
+            Task::Step(Step::Call(CallStep::ValueBegin {
                 args,
-                via: Via::Value { recv: false },
+                recv: false,
                 dst,
                 node,
             })),
@@ -219,9 +262,9 @@ impl<L: Lookup> Gen<'_, '_, L> {
         dst: Dst,
     ) {
         let node = NodeRef::Expr(e);
-        let begin = Task::Step(Step::Call(CallStep::PacketBegin {
+        let begin = Task::Step(Step::Call(CallStep::ValueBegin {
             args,
-            via: Via::Value { recv: true },
+            recv: true,
             dst,
             node,
         }));
@@ -250,8 +293,11 @@ impl<L: Lookup> Gen<'_, '_, L> {
         node: NodeRef,
     ) -> Result<(), CompileError> {
         let list = self.cx.hir.list(args);
-        if list.iter().any(|a| a.kind != ArgKind::Positional) || list.len() > usize::from(u8::MAX) {
+        if list.iter().any(|a| a.kind != ArgKind::Positional) {
             return Err(self.cx.unsupported(Unsupported::ExternArgs, node));
+        }
+        if list.len() > MAX_ARITY {
+            return Err(self.too_many_args(node));
         }
         let argc = u8::try_from(list.len()).unwrap_or(u8::MAX);
         let import = self.cx.import(module, name, argc);
@@ -274,6 +320,14 @@ impl<L: Lookup> Gen<'_, '_, L> {
         Ok(())
     }
 
+    pub(crate) fn too_many_args(&self, node: NodeRef) -> CompileError {
+        CompileError::TooManyArgs {
+            node,
+            span: self.cx.span(node),
+            limit: MAX_ARITY as u32,
+        }
+    }
+
     fn direct_call(
         &mut self,
         item: hir_lang::ItemId,
@@ -286,18 +340,32 @@ impl<L: Lookup> Gen<'_, '_, L> {
         let Some(info) = self.cx.fns.get(&item).cloned() else {
             return Ok(());
         };
-        let Some(func) = info.body else {
+        let Some(callable) = info.callable else {
             return Ok(());
         };
-        let arranged = arrange(&info.params, list);
-        let Some((dests, mask)) = arranged else {
-            // Spreads, or arguments that do not fit: the dynamic entry binds
-            // them at run time (and raises the error, if any).
-            let Some(entry) = self.cx.dyn_entry(item) else {
-                return Ok(());
-            };
-            self.packet_args(args, Via::Direct(entry), dst, node)?;
-            return Ok(());
+        let Some((dests, mask)) = arrange(&info.params, list) else {
+            // Spreads, or arguments that do not bind: a dynamic call of the
+            // function value binds them at run time (or raises
+            // `ArgumentError` there).
+            let f = self.fx.temp(ValType::Dyn);
+            self.emit(Inst::MakeClosure {
+                dst: f,
+                func: callable,
+            });
+            self.vals.push(Val {
+                reg: f,
+                rel: Rel::Temp,
+            });
+            return self.call_step(CallStep::ValueBegin {
+                args,
+                recv: false,
+                dst,
+                node,
+            });
+        };
+        let target = match info.gen_body {
+            Some(g) => Direct::Coro(g),
+            None => Direct::Call(callable),
         };
         let mut shape: Vec<ValType> = alloc::vec![ValType::Dyn];
         shape.extend_from_slice(&info.sig);
@@ -306,12 +374,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
         // Absent parameters are nil; the mask says which are present.
         for i in 0..n {
             let filled = i < 64 && mask & (1 << i) != 0;
-            let is_rest = info.params.get(i).is_some_and(|p| {
-                matches!(
-                    p.kind,
-                    hir_lang::ParamKind::Rest | hir_lang::ParamKind::RestNamed
-                )
-            });
+            let is_rest = info.params.get(i).is_some_and(PInfo::rest);
             if !filled && !is_rest {
                 self.emit(Inst::LoadNil {
                     dst: FnCx::slot(win.1, i + 1),
@@ -326,15 +389,15 @@ impl<L: Lookup> Gen<'_, '_, L> {
         let mut rest_named = None;
         for (i, p) in info.params.iter().enumerate() {
             match p.kind {
-                hir_lang::ParamKind::Rest => rest = Some((self.new_map(), i)),
-                hir_lang::ParamKind::RestNamed => rest_named = Some((self.new_map(), i)),
+                ParamKind::Rest => rest = Some((self.new_map(), i)),
+                ParamKind::RestNamed => rest_named = Some((self.new_map(), i)),
                 _ => {}
             }
         }
         let argc = u8::try_from(info.sig.len()).unwrap_or(u8::MAX);
         self.tasks
             .push(Task::Step(Step::Call(CallStep::DirectFinish {
-                func,
+                target,
                 win,
                 argc,
                 rest,
@@ -342,211 +405,157 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 dst,
                 node,
             })));
-        for (a, to) in list.iter().zip(dests.iter()).rev() {
+        let mut ts: Vec<Task> = Vec::with_capacity(list.len() * 2);
+        for (a, to) in list.iter().zip(dests.iter()) {
             match *to {
                 To::Param(j) => {
                     let slot = FnCx::slot(win.1, j + 1);
                     let by_ref = info.params.get(j).is_some_and(|p| p.by_ref);
-                    if by_ref {
-                        match self.place_cell(a)? {
-                            Some(c) => self.push_cell_into(c, slot),
-                            None if a.place => {
-                                return Err(self
-                                    .cx
-                                    .unsupported(Unsupported::RefPlace, NodeRef::Expr(a.value)));
-                            }
-                            None => {
-                                let dup = self.needs_dup(a.value);
-                                self.tasks.push(Task::NewCell { cell: slot, dup });
-                                self.tasks.push(Task::Expr(a.value, Dst::Any));
-                            }
-                        }
+                    if by_ref && a.place {
+                        // A reference to the caller's place.
+                        let (pts, idx) = self.place_tasks(a.value, true)?;
+                        ts.extend(pts);
+                        ts.push(Task::Step(Step::Place(PlaceStep::Ref { idx, node })));
+                        ts.push(Task::Deliver {
+                            dst: Dst::Reg(slot),
+                            dup: false,
+                        });
+                        ts.push(Task::Step(Step::Place(PlaceStep::Drop { idx })));
+                    } else if by_ref {
+                        // A value: a temporary reference (LSB §5.15 step 5).
+                        let dup = self.needs_dup(a.value);
+                        ts.push(Task::Expr(a.value, Dst::Any));
+                        ts.push(Task::NewCell { cell: slot, dup });
                     } else {
-                        let t = self.store_expr_tasks(a.value, slot);
-                        self.tasks.push(t[1].clone());
-                        self.tasks.push(t[0].clone());
+                        ts.extend(self.store_expr_tasks(a.value, slot));
                     }
                 }
                 To::Rest => {
                     if let Some((map, _)) = rest {
                         let dup = self.needs_dup(a.value);
-                        self.tasks.push(Task::MapPush { map, dup, node });
-                        self.tasks.push(Task::Expr(a.value, Dst::Any));
+                        ts.push(Task::Expr(a.value, Dst::Any));
+                        ts.push(Task::MapPush { map, dup, node });
                     }
                 }
-                To::RestNamed(name) => {
-                    if let Some((map, _)) = rest_named {
+                To::RestNamed(name) | To::RestNamedInRest(name) => {
+                    let into = if matches!(to, To::RestNamed(_)) {
+                        rest_named
+                    } else {
+                        rest
+                    };
+                    if let Some((map, _)) = into {
                         let dup = self.needs_dup(a.value);
-                        self.tasks.push(Task::MapSetName {
+                        ts.push(Task::Expr(a.value, Dst::Any));
+                        ts.push(Task::MapSetName {
                             map,
                             name,
                             dup,
                             node,
                         });
-                        self.tasks.push(Task::Expr(a.value, Dst::Any));
                     }
                 }
             }
         }
+        self.sched_all(ts);
         Ok(())
     }
 
-    /// The variable a place argument shares by reference, if it is one that
-    /// lives in a cell (a shared local, or a global or static shared by
-    /// reference).
-    fn place_cell(&self, a: &Arg) -> Result<Option<Slot>, CompileError> {
-        if !a.place {
-            return Ok(None);
-        }
-        let hir = self.cx.hir;
-        if let hir_lang::Expr::Path(p) = *hir.expr(a.value) {
-            let res = hir.path(p).res;
-            let slot = match res {
-                Res::Local(b) => self.cx.slot(b),
-                Res::Def(_) => match self.cx.local_item(res, NodeRef::Path(p))? {
-                    Some(i) if matches!(hir.item(i).kind, ItemKind::Global { .. }) => {
-                        self.cx.global_slot(i)
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(s @ (Slot::Cell(_) | Slot::GlobalCell(_))) = slot {
-                return Ok(Some(s));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Schedules moving a shared variable's cell into `dst`.
-    fn push_cell_into(&mut self, slot: Slot, dst: Reg) {
-        match slot {
-            Slot::Cell(c) => self.tasks.push(Task::Emit(Inst::Mov { dst, src: c })),
-            Slot::GlobalCell(g) => self
-                .tasks
-                .push(Task::Emit(Inst::GetGlobal { dst, global: g })),
-            Slot::Reg(_) | Slot::Global(_) => {}
-        }
-    }
-
-    /// Schedules the packet of a call whose callee (and receiver) are, or
-    /// will be, on the value stack.
-    fn packet_args(
+    /// Schedules the arguments of a dynamic call whose callee (and receiver)
+    /// are on the value stack.
+    fn value_begin(
         &mut self,
         args: List<Arg>,
-        via: Via,
+        recv: bool,
         dst: Dst,
         node: NodeRef,
     ) -> Result<(), CompileError> {
         let list = self.cx.hir.list(args);
-        let pos = self.new_map();
-        if let Via::Value { recv: true } = via {
+        let n = list.len() + usize::from(recv);
+        if n > MAX_ARITY {
+            return Err(self.too_many_args(node));
+        }
+        let callee = self.vals.last().copied().map_or(Reg(0), |v| v.reg);
+        let shape = alloc::vec![ValType::Dyn; n + 1];
+        let win = self.fx.window(&shape);
+        let mut kinds: Vec<LArgKind> = Vec::with_capacity(n);
+        if recv {
             // The receiver is the first argument; it lies below the callee.
             let at = self.vals.len().saturating_sub(2);
             if let Some(&r) = self.vals.get(at) {
-                let dup = self.php();
-                let t = self.fx.temp(ValType::Dyn);
-                if dup {
-                    self.dup_into(t, r.reg);
+                let slot = FnCx::slot(win.1, 1);
+                if self.php() {
+                    self.dup_into(slot, r.reg);
                 } else {
-                    self.emit(Inst::Mov { dst: t, src: r.reg });
+                    self.emit(Inst::Mov {
+                        dst: slot,
+                        src: r.reg,
+                    });
                 }
-                self.emit(Inst::MapPush { map: pos, src: t });
-                self.fx.release(t);
             }
+            kinds.push(LArgKind::Positional);
         }
-        let named = if list
-            .iter()
-            .any(|a| matches!(a.kind, ArgKind::Named(_) | ArgKind::SpreadNamed))
-        {
-            Some(self.new_map())
-        } else {
-            None
-        };
-        self.tasks
-            .push(Task::Step(Step::Call(CallStep::PacketFinish {
-                pos,
-                named,
-                via,
-                dst,
-                node,
-            })));
-        for a in list.iter().rev() {
-            match a.kind {
-                ArgKind::Positional => match self.place_cell(a)? {
-                    // A shared variable passed as a place: its cell, so a
-                    // by-reference parameter aliases it.
-                    Some(c) => {
-                        let cell_ty = self.cell_ty();
-                        let t = self.fx.temp(cell_ty);
-                        self.tasks.push(Task::Free(t));
-                        self.tasks
-                            .push(Task::Emit(Inst::MapPush { map: pos, src: t }));
-                        self.push_cell_into(c, t);
-                    }
-                    None => {
-                        let dup = self.needs_dup(a.value);
-                        self.tasks.push(Task::MapPush {
-                            map: pos,
-                            dup,
-                            node,
-                        });
-                        self.tasks.push(Task::Expr(a.value, Dst::Any));
-                    }
-                },
+        let mut pos = i64::from(recv);
+        let mut spread = false;
+        let mut ts: Vec<Task> = Vec::with_capacity(list.len() * 2);
+        for (i, a) in list.iter().enumerate() {
+            let slot = FnCx::slot(win.1, i + 1 + usize::from(recv));
+            let at = match a.kind {
+                ArgKind::Positional => {
+                    kinds.push(LArgKind::Positional);
+                    pos += 1;
+                    // After a spread the position is known only at run
+                    // time: such a place argument is passed by value.
+                    (!spread).then_some(ArgAt::Pos(pos - 1))
+                }
                 ArgKind::Named(id) => {
-                    let map = named.unwrap_or(pos);
-                    let dup = self.needs_dup(a.value);
-                    match self.place_cell(a)? {
-                        Some(c) => {
-                            let cell_ty = self.cell_ty();
-                            let t = self.fx.temp(cell_ty);
-                            self.tasks.push(Task::MapSetName {
-                                map,
-                                name: id.sym,
-                                dup: false,
-                                node,
-                            });
-                            self.tasks.push(Task::Push(Val {
-                                reg: t,
-                                rel: Rel::Temp,
-                            }));
-                            self.push_cell_into(c, t);
-                        }
-                        None => {
-                            self.tasks.push(Task::MapSetName {
-                                map,
-                                name: id.sym,
-                                dup,
-                                node,
-                            });
-                            self.tasks.push(Task::Expr(a.value, Dst::Any));
-                        }
-                    }
+                    let text = self.cx.text(id.sym);
+                    let s = self.cx.mb.string(&text);
+                    kinds.push(LArgKind::Named(s));
+                    Some(ArgAt::Name(id.sym))
                 }
-                ArgKind::Spread => {
-                    self.tasks
-                        .push(Task::Step(Step::Call(CallStep::Spread { pos, node })));
-                    self.tasks.push(Task::Expr(a.value, Dst::Temp));
+                ArgKind::Spread | ArgKind::SpreadNamed => {
+                    kinds.push(if a.kind == ArgKind::Spread {
+                        LArgKind::Spread
+                    } else {
+                        LArgKind::SpreadNamed
+                    });
+                    spread = true;
+                    // The container is only read (its elements bind).
+                    ts.push(Task::Expr(a.value, Dst::Reg(slot)));
+                    ts.push(Task::At(node));
+                    continue;
                 }
-                ArgKind::SpreadNamed => {
-                    let named = named.unwrap_or(pos);
-                    self.tasks
-                        .push(Task::Step(Step::Call(CallStep::SpreadNamed {
-                            named,
-                            node,
-                        })));
-                    self.tasks.push(Task::Expr(a.value, Dst::Temp));
+            };
+            match (a.place, at) {
+                (true, Some(at)) => {
+                    let (pts, idx) = self.place_tasks(a.value, true)?;
+                    ts.extend(pts);
+                    ts.push(Task::Step(Step::Call(CallStep::PlaceArg {
+                        idx,
+                        callee,
+                        at,
+                        slot,
+                        node,
+                    })));
                 }
+                _ => ts.extend(self.store_expr_tasks(a.value, slot)),
             }
         }
+        ts.push(Task::Step(Step::Call(CallStep::ValueFinish {
+            win,
+            kinds,
+            recv,
+            dst,
+            node,
+        })));
+        self.sched_all(ts);
         Ok(())
     }
 
     pub(crate) fn call_step(&mut self, s: CallStep) -> Result<(), CompileError> {
         match s {
             CallStep::DirectFinish {
-                func,
+                target,
                 win,
                 argc,
                 rest,
@@ -562,11 +571,18 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     });
                     self.fx.release(map);
                 }
-                self.emit(Inst::Call {
-                    dst: win.1,
-                    func,
-                    argc,
-                });
+                match target {
+                    Direct::Call(func) => self.emit(Inst::Call {
+                        dst: win.1,
+                        func,
+                        argc,
+                    }),
+                    Direct::Coro(func) => self.emit(Inst::CoroNew {
+                        dst: win.1,
+                        func,
+                        argc,
+                    }),
+                }
                 self.deliver(
                     Val {
                         reg: win.1,
@@ -598,60 +614,48 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     false,
                 );
             }
-            CallStep::PacketBegin {
+            CallStep::ValueBegin {
                 args,
-                via,
+                recv,
                 dst,
                 node,
             } => {
                 self.at(node);
-                self.packet_args(args, via, dst, node)?;
+                self.value_begin(args, recv, dst, node)?;
             }
-            CallStep::PacketFinish {
-                pos,
-                named,
-                via,
+            CallStep::ValueFinish {
+                win,
+                kinds,
+                recv,
                 dst,
                 node,
             } => {
                 self.at(node);
-                let win = self.fx.window(&[ValType::Dyn, ValType::Dyn, ValType::Dyn]);
-                self.emit(Inst::Mov {
-                    dst: FnCx::slot(win.1, 1),
-                    src: pos,
-                });
-                match named {
-                    Some(m) => self.emit(Inst::Mov {
-                        dst: FnCx::slot(win.1, 2),
-                        src: m,
-                    }),
-                    None => self.emit(Inst::LoadNil {
-                        dst: FnCx::slot(win.1, 2),
-                    }),
-                }
-                match via {
-                    Via::Direct(func) => self.emit(Inst::Call {
+                let callee = self.pop();
+                let argc = u8::try_from(kinds.len()).unwrap_or(u8::MAX);
+                if kinds.iter().all(|k| *k == LArgKind::Positional) {
+                    self.emit(Inst::DCall {
                         dst: win.1,
-                        func,
-                        argc: 2,
-                    }),
-                    Via::Value { recv } => {
-                        let callee = self.pop();
-                        self.emit(Inst::DCall {
-                            dst: win.1,
-                            callee: callee.reg,
-                            argc: 2,
-                        });
-                        self.release(callee);
-                        if recv {
-                            let r = self.pop();
-                            self.release(r);
-                        }
-                    }
+                        callee: callee.reg,
+                        argc,
+                    });
+                } else if CallShape::new(kinds.clone()).validate().is_ok() {
+                    let shape = self.fx.f.call_shape(&kinds);
+                    self.emit(Inst::DCallShape {
+                        dst: win.1,
+                        callee: callee.reg,
+                        shape,
+                    });
+                } else {
+                    // A positional or spread argument after a named one:
+                    // what the binder raises (LSB §5.15 step 3a), once every
+                    // argument was evaluated.
+                    self.raise_kind(bytecode_lang::ErrorKind::ArgumentError);
                 }
-                self.fx.release(pos);
-                if let Some(m) = named {
-                    self.fx.release(m);
+                self.release(callee);
+                if recv {
+                    let r = self.pop();
+                    self.release(r);
                 }
                 self.deliver(
                     Val {
@@ -662,17 +666,57 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     false,
                 );
             }
-            CallStep::Spread { pos, node } => {
+            CallStep::PlaceArg {
+                idx,
+                callee,
+                at,
+                slot,
+                node,
+            } => {
                 self.at(node);
-                let v = self.pop();
-                self.spread(pos, v.reg, false);
-                self.release(v);
-            }
-            CallStep::SpreadNamed { named, node } => {
-                self.at(node);
-                let v = self.pop();
-                self.spread(named, v.reg, true);
-                self.release(v);
+                let b = self.fx.temp(ValType::Bool);
+                match at {
+                    ArgAt::Pos(p) => {
+                        let r = self.fx.temp(ValType::I64);
+                        self.load_i64(r, p);
+                        self.emit(Inst::DParamRef {
+                            dst: b,
+                            callee,
+                            pos: r,
+                        });
+                        self.fx.release(r);
+                    }
+                    ArgAt::Name(name) => {
+                        let n = self.name_ref(name);
+                        self.emit(Inst::DParamRefNamed {
+                            dst: b,
+                            callee,
+                            name: n,
+                        });
+                    }
+                }
+                let by_val = self.label();
+                let done = self.label();
+                self.jump_on(b, by_val, false);
+                self.fx.release(b);
+                self.tasks
+                    .push(Task::Step(Step::Place(PlaceStep::Drop { idx })));
+                self.tasks.push(Task::Bind(done));
+                // By value: the place's current value, copied (PHP).
+                self.tasks.push(Task::Deliver {
+                    dst: Dst::Reg(slot),
+                    dup: self.php(),
+                });
+                self.tasks
+                    .push(Task::Step(Step::Place(PlaceStep::Read { idx, node })));
+                self.tasks.push(Task::Bind(by_val));
+                self.tasks.push(Task::Jump(done));
+                self.tasks.push(Task::Deliver {
+                    dst: Dst::Reg(slot),
+                    dup: false,
+                });
+                self.tasks
+                    .push(Task::Step(Step::Place(PlaceStep::Ref { idx, node })));
             }
             CallStep::Method { name, node } => {
                 self.at(node);
@@ -715,403 +759,12 @@ impl<L: Lookup> Gen<'_, '_, L> {
         Ok(())
     }
 
-    /// Appends the values of the collection in `src` to the packet map
-    /// `into` (`named`: its string-keyed entries, as named arguments; a key
-    /// that is not a string is a `TypeError`).
-    fn spread(&mut self, into: Reg, src: Reg, named: bool) {
-        let it = self.fx.temp(ValType::Dyn);
-        let has = self.fx.temp(ValType::Bool);
-        let v = self.fx.temp(ValType::Dyn);
-        let top = self.label();
-        let done = self.label();
-        self.emit(Inst::DIterNew { dst: it, src });
-        self.bind(top);
-        self.emit(Inst::IterNext {
-            has,
-            iter: it,
-            val: v,
-        });
-        self.jump_on(has, done, false);
-        if self.php() {
-            self.dup_into(v, v);
-        }
-        if named {
-            let k = self.fx.temp(ValType::Dyn);
-            let ok = self.label();
-            self.emit(Inst::IterKey { dst: k, iter: it });
-            self.emit(Inst::IsKind {
-                dst: has,
-                src: k,
-                kind: Kind::Str,
-            });
-            self.jump_on(has, ok, true);
-            self.raise_type_error();
-            self.bind(ok);
-            self.emit(Inst::MapSet {
-                map: into,
-                key: k,
-                src: v,
-            });
-            self.fx.release(k);
-        } else {
-            self.emit(Inst::MapPush { map: into, src: v });
-        }
-        self.emit(Inst::Safepoint {});
-        self.jmp(top);
-        self.bind(done);
-        self.fx.release(v);
-        self.fx.release(has);
-        self.fx.release(it);
-    }
-
-    /// Unpacks an argument packet into parameter registers, by the same rules
-    /// [`arrange`] applies at compile time:
-    /// positional arguments fill the positional parameters in order, extra
-    /// ones go to the rest parameter (else `TypeError`); named arguments fill
-    /// the named-capable parameter of that name (twice is a `TypeError`), or
-    /// the named rest parameter (else `TypeError`); a required parameter
-    /// left empty is a `TypeError`. `mask` receives the presence bits.
-    pub(crate) fn unpack(
-        &mut self,
-        params: &[PInfo],
-        pos: Reg,
-        named: Reg,
-        dests: &[Reg],
-        mask: Reg,
-    ) {
-        let place = self.cx.an.place_args;
-        let map_ty = self.map_ty();
-        let tr = self.map_ref();
-        let m = self.fx.temp(map_ty);
-        let npos = self.fx.temp(ValType::I64);
-        let b = self.fx.temp(ValType::Bool);
-        let k = self.fx.temp(ValType::I64);
-        let kd = self.fx.temp(ValType::Dyn);
-        let v = self.fx.temp(ValType::Dyn);
-        let bit = self.fx.temp(ValType::I64);
-        let zero = self.fx.temp(ValType::I64);
-        self.emit(Inst::Cast {
-            dst: m,
-            src: pos,
-            ty: tr,
-        });
-        self.emit(Inst::MapLen { dst: npos, map: m });
-        self.load_i64(mask, 0);
-        self.load_i64(zero, 0);
-        let positional: Vec<usize> = (0..params.len())
-            .filter(|&i| params.get(i).is_some_and(PInfo::positional))
-            .collect();
-        for (j, &pi) in positional.iter().enumerate() {
-            let skip = self.label();
-            self.load_i64(k, j as i64);
-            self.emit(Inst::ILt {
-                dst: b,
-                lhs: k,
-                rhs: npos,
-                ty: bytecode_lang::IntTy::I64,
-            });
-            self.jump_on(b, skip, false);
-            self.load_dyn_int(kd, j as i64);
-            self.emit(Inst::MapGet {
-                dst: v,
-                map: m,
-                key: kd,
-            });
-            let by_ref = params.get(pi).is_some_and(|p| p.by_ref);
-            let dest = dests.get(pi).copied().unwrap_or(Reg(0));
-            self.normalize(v, dest, by_ref, place, b);
-            self.set_bit(mask, bit, pi);
-            self.bind(skip);
-        }
-        // Extra positional arguments.
-        let np = positional.len() as i64;
-        let rest = params
-            .iter()
-            .position(|p| p.kind == hir_lang::ParamKind::Rest);
-        self.load_i64(k, np);
-        match rest {
-            Some(ri) => {
-                let rm = self.new_map();
-                let top = self.label();
-                let done = self.label();
-                let one = self.fx.temp(ValType::I64);
-                self.load_i64(one, 1);
-                self.bind(top);
-                self.emit(Inst::ILt {
-                    dst: b,
-                    lhs: k,
-                    rhs: npos,
-                    ty: bytecode_lang::IntTy::I64,
-                });
-                self.jump_on(b, done, false);
-                self.emit(Inst::ToDyn {
-                    dst: kd,
-                    src: k,
-                    from: bytecode_lang::Prim::I64,
-                });
-                self.emit(Inst::MapGet {
-                    dst: v,
-                    map: m,
-                    key: kd,
-                });
-                let t = self.fx.temp(ValType::Dyn);
-                self.normalize(v, t, false, place, b);
-                self.emit(Inst::MapPush { map: rm, src: t });
-                self.fx.release(t);
-                self.emit(Inst::IAdd {
-                    dst: k,
-                    lhs: k,
-                    rhs: one,
-                    op: bytecode_lang::IntOp::new(bytecode_lang::IntTy::I64),
-                });
-                self.emit(Inst::Safepoint {});
-                self.jmp(top);
-                self.bind(done);
-                self.fx.release(one);
-                if let Some(&d) = dests.get(ri) {
-                    self.emit(Inst::Mov { dst: d, src: rm });
-                }
-                self.fx.release(rm);
-            }
-            None => {
-                let ok = self.label();
-                self.emit(Inst::IGt {
-                    dst: b,
-                    lhs: npos,
-                    rhs: k,
-                    ty: bytecode_lang::IntTy::I64,
-                });
-                self.jump_on(b, ok, false);
-                self.raise_type_error();
-                self.bind(ok);
-            }
-        }
-        // Named arguments.
-        let rest_named = params
-            .iter()
-            .position(|p| p.kind == hir_lang::ParamKind::RestNamed);
-        let rnm = rest_named.map(|_| self.new_map());
-        let none = self.label();
-        self.emit(Inst::IsKind {
-            dst: b,
-            src: named,
-            kind: Kind::Nil,
-        });
-        self.jump_on(b, none, true);
-        let nm = self.fx.temp(map_ty);
-        let it_ty = ValType::Ref(self.cx.types.iter);
-        let it = self.fx.temp(it_ty);
-        let key = self.fx.temp(ValType::Dyn);
-        let ks = self.fx.temp(ValType::Str);
-        let s = self.fx.temp(ValType::Str);
-        self.emit(Inst::Cast {
-            dst: nm,
-            src: named,
-            ty: tr,
-        });
-        self.emit(Inst::IterNew { dst: it, src: nm });
-        let top = self.label();
-        let next = self.label();
-        let bad = self.label();
-        self.bind(top);
-        self.emit(Inst::IterNext {
-            has: b,
-            iter: it,
-            val: v,
-        });
-        self.jump_on(b, none, false);
-        self.emit(Inst::IterKey { dst: key, iter: it });
-        self.emit(Inst::IsKind {
-            dst: b,
-            src: key,
-            kind: Kind::Str,
-        });
-        self.jump_on(b, bad, false);
-        self.emit(Inst::FromDyn {
-            dst: ks,
-            src: key,
-            to: bytecode_lang::Prim::Str,
-        });
-        let mut matches: Vec<(usize, Label)> = Vec::new();
-        for (pi, p) in params.iter().enumerate() {
-            if !p.nameable() {
-                continue;
-            }
-            let Some(name) = p.name else { continue };
-            let text = self.cx.text(name);
-            let sid = self.cx.mb.string(&text);
-            let kc = self.cx.mb.constant(bytecode_lang::Const::Str(sid));
-            self.emit(Inst::LoadConst { dst: s, k: kc });
-            self.emit(Inst::StrEq {
-                dst: b,
-                lhs: ks,
-                rhs: s,
-            });
-            let l = self.label();
-            self.jump_on(b, l, true);
-            matches.push((pi, l));
-        }
-        match rnm {
-            Some(rm) => {
-                let t = self.fx.temp(ValType::Dyn);
-                self.normalize(v, t, false, place, b);
-                self.emit(Inst::MapSet {
-                    map: rm,
-                    key,
-                    src: t,
-                });
-                self.fx.release(t);
-                self.jmp(next);
-            }
-            None => self.jmp(bad),
-        }
-        for (pi, l) in matches {
-            self.bind(l);
-            // Already filled (positionally or by an earlier name): an error.
-            self.load_bit(bit, pi);
-            self.emit(Inst::IAnd {
-                dst: k,
-                lhs: mask,
-                rhs: bit,
-                op: bytecode_lang::IntOp::new(bytecode_lang::IntTy::I64),
-            });
-            self.emit(Inst::INe {
-                dst: b,
-                lhs: k,
-                rhs: zero,
-                ty: bytecode_lang::IntTy::I64,
-            });
-            self.jump_on(b, bad, true);
-            let by_ref = params.get(pi).is_some_and(|p| p.by_ref);
-            let dest = dests.get(pi).copied().unwrap_or(Reg(0));
-            self.normalize(v, dest, by_ref, place, b);
-            self.emit(Inst::IOr {
-                dst: mask,
-                lhs: mask,
-                rhs: bit,
-                op: bytecode_lang::IntOp::new(bytecode_lang::IntTy::I64),
-            });
-            self.jmp(next);
-        }
-        self.bind(next);
-        self.emit(Inst::Safepoint {});
-        self.jmp(top);
-        self.bind(bad);
-        self.raise_type_error();
-        self.jmp(none);
-        self.bind(none);
-        if let (Some(ri), Some(rm)) = (rest_named, rnm) {
-            if let Some(&d) = dests.get(ri) {
-                self.emit(Inst::Mov { dst: d, src: rm });
-            }
-            self.fx.release(rm);
-        }
-        // Required parameters.
-        for (pi, p) in params.iter().enumerate() {
-            if !p.required() {
-                continue;
-            }
-            let ok = self.label();
-            self.load_bit(bit, pi);
-            self.emit(Inst::IAnd {
-                dst: k,
-                lhs: mask,
-                rhs: bit,
-                op: bytecode_lang::IntOp::new(bytecode_lang::IntTy::I64),
-            });
-            self.emit(Inst::INe {
-                dst: b,
-                lhs: k,
-                rhs: zero,
-                ty: bytecode_lang::IntTy::I64,
-            });
-            self.jump_on(b, ok, true);
-            self.raise_type_error();
-            self.bind(ok);
-        }
-        for r in [s, ks, key, it, nm, zero, bit, v, kd, k, b, npos, m] {
-            self.fx.release(r);
-        }
-    }
-
-    /// Moves an argument into its parameter register: a by-reference
-    /// parameter takes the caller's cell (or a new cell around a value); a
-    /// by-value one takes the value (out of the cell, copied, when a caller
-    /// passed a shared variable as a place).
-    fn normalize(&mut self, v: Reg, dest: Reg, by_ref: bool, place: bool, b: Reg) {
-        let tr = self.cell_ref();
-        if by_ref {
-            let wrap = self.label();
-            let done = self.label();
-            self.emit(Inst::IsType {
-                dst: b,
-                src: v,
-                ty: tr,
-            });
-            self.jump_on(b, wrap, false);
-            self.emit(Inst::Cast {
-                dst: dest,
-                src: v,
-                ty: tr,
-            });
-            self.jmp(done);
-            self.bind(wrap);
-            self.emit(Inst::NewCell {
-                dst: dest,
-                src: v,
-                ty: tr,
-            });
-            self.bind(done);
-        } else if place {
-            let plain = self.label();
-            let done = self.label();
-            self.emit(Inst::IsType {
-                dst: b,
-                src: v,
-                ty: tr,
-            });
-            self.jump_on(b, plain, false);
-            let cell_ty = self.cell_ty();
-            let c = self.fx.temp(cell_ty);
-            self.emit(Inst::Cast {
-                dst: c,
-                src: v,
-                ty: tr,
-            });
-            self.emit(Inst::CellGet { dst: dest, cell: c });
-            self.fx.release(c);
-            if self.php() {
-                self.dup_into(dest, dest);
-            }
-            self.jmp(done);
-            self.bind(plain);
-            self.emit(Inst::Mov { dst: dest, src: v });
-            self.bind(done);
-        } else {
-            self.emit(Inst::Mov { dst: dest, src: v });
-        }
-    }
-
-    fn load_bit(&mut self, bit: Reg, i: usize) {
-        let v = 1i64.wrapping_shl(u32::try_from(i).unwrap_or(63));
-        self.load_i64(bit, v);
-    }
-
-    fn set_bit(&mut self, mask: Reg, bit: Reg, i: usize) {
-        self.load_bit(bit, i);
-        self.emit(Inst::IOr {
-            dst: mask,
-            lhs: mask,
-            rhs: bit,
-            op: bytecode_lang::IntOp::new(bytecode_lang::IntTy::I64),
-        });
-    }
-
     /// Tests presence bit `i` of `mask` into the `bool` register `b`.
     pub(crate) fn test_bit(&mut self, mask: Reg, i: usize, b: Reg) {
         let bit = self.fx.temp(ValType::I64);
         let zero = self.fx.temp(ValType::I64);
-        self.load_bit(bit, i);
+        let v = 1i64.wrapping_shl(u32::try_from(i).unwrap_or(63));
+        self.load_i64(bit, v);
         self.load_i64(zero, 0);
         self.emit(Inst::IAnd {
             dst: bit,
@@ -1176,19 +829,23 @@ mod tests {
         let (to, mask) =
             arrange(&ps, &[pos(), pos(), pos(), named(3)]).unwrap_or_else(|| panic!("fits"));
         assert_eq!(to, [To::Param(0), To::Param(1), To::Rest, To::Param(3)]);
-        assert_eq!(mask, 0b1011);
+        // The rest parameter's bit is set when it received an argument.
+        assert_eq!(mask, 0b1111);
         // A default may be omitted; a required parameter may not.
         assert!(arrange(&ps, &[pos()]).is_some());
         assert!(arrange(&ps, &[named(3)]).is_none());
+        // An unknown name goes to the rest map when there is no named rest.
+        let (to, _) = arrange(&ps, &[pos(), named(9)]).unwrap_or_else(|| panic!("fits"));
+        assert_eq!(to, [To::Param(0), To::RestNamedInRest(sym(9))]);
     }
 
     #[test]
-    fn duplicates_unknown_names_and_spreads_go_through_the_packet() {
+    fn duplicates_unknown_names_and_spreads_bind_at_run_time() {
         let ps = [
             param(0, ParamKind::Normal, false),
             param(1, ParamKind::PositionalOnly, true),
         ];
-        // Named then positional for the same parameter.
+        // A positional argument after a named one.
         assert!(arrange(&ps, &[named(0), pos()]).is_none());
         // A positional-only parameter cannot be named.
         assert!(arrange(&ps, &[pos(), named(1)]).is_none());

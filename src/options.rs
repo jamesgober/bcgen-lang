@@ -6,6 +6,8 @@ use alloc::vec::Vec;
 use bytecode_lang::Hook;
 use hir_lang::Span;
 
+use crate::intrinsics::Intrinsics;
+
 /// How arrays and maps behave when a value is copied.
 ///
 /// # Examples
@@ -75,7 +77,7 @@ pub enum BodyMode {
 }
 
 /// Compilation options: the dynamic profile's array and key semantics, the
-/// body's role, host linkage, and budgets.
+/// body's role, host linkage, the intrinsic table, and budgets.
 ///
 /// The default is the PHP profile Mox needs: value arrays and PHP keys.
 ///
@@ -99,6 +101,7 @@ pub struct Options {
     file: String,
     host_module: String,
     hooks: Vec<(Hook, String, String)>,
+    intrinsics: Intrinsics,
     max_instructions: u64,
 }
 
@@ -113,7 +116,8 @@ impl Options {
     pub const DEFAULT_MAX_INSTRUCTIONS: u64 = 64 << 20;
 
     /// The PHP profile: [`ArraySemantics::Php`], [`KeyCoercion::Php`],
-    /// [`BodyMode::Start`], file name `<hir>`, host module `host`, no hooks.
+    /// [`BodyMode::Start`], file name `<hir>`, host module `host`, no hooks,
+    /// and the built-in intrinsics ([`Intrinsics::core`]).
     ///
     /// # Examples
     ///
@@ -132,6 +136,7 @@ impl Options {
             file: String::from("<hir>"),
             host_module: String::from("host"),
             hooks: Vec::new(),
+            intrinsics: Intrinsics::core(),
             max_instructions: Self::DEFAULT_MAX_INSTRUCTIONS,
         }
     }
@@ -236,6 +241,25 @@ impl Options {
         self
     }
 
+    /// Sets the intrinsic table: how each named intrinsic compiles (an LSB
+    /// sequence, a host function, or a guarded fast path over one). Names
+    /// not in it do not compile
+    /// ([`CompileError::UnknownIntrinsic`](crate::CompileError::UnknownIntrinsic)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bcgen_lang::{Intrinsics, Options};
+    ///
+    /// let o = Options::new().with_intrinsics(Intrinsics::mox());
+    /// assert!(o.intrinsics().get("mox.loose_eq").is_some());
+    /// ```
+    #[must_use]
+    pub fn with_intrinsics(mut self, intrinsics: Intrinsics) -> Self {
+        self.intrinsics = intrinsics;
+        self
+    }
+
     /// Sets the instruction budget for the whole module; compilation stops
     /// with [`CompileError::BudgetExceeded`](crate::CompileError) beyond it.
     ///
@@ -322,6 +346,18 @@ impl Options {
     #[must_use]
     pub fn hooks(&self) -> &[(Hook, String, String)] {
         &self.hooks
+    }
+
+    /// The intrinsic table.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bcgen_lang::Options::new().intrinsics(), &bcgen_lang::Intrinsics::core());
+    /// ```
+    #[must_use]
+    pub fn intrinsics(&self) -> &Intrinsics {
+        &self.intrinsics
     }
 
     /// The instruction budget.

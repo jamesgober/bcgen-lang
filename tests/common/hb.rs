@@ -484,6 +484,94 @@ impl H {
         (hir, self.names)
     }
 
+    // -------------------------------------------------------------- 0.3 forms
+
+    /// A generator function (`YIELD`).
+    pub fn gen_func(&mut self, name: &str, params: &[ParamId], body: ExprId) -> ItemId {
+        self.func_with(name, params, body, Effects::THROWS.union(Effects::YIELD))
+    }
+
+    /// A function with the given effects.
+    pub fn func_with(
+        &mut self,
+        name: &str,
+        params: &[ParamId],
+        body: ExprId,
+        effects: Effects,
+    ) -> ItemId {
+        self.tick();
+        let n = self.name(name);
+        let params = self.b.list(params);
+        self.b.item(Item::new(
+            Some(n),
+            ItemKind::Fn(FnDef {
+                params,
+                body: Some(body),
+                effects,
+                ..FnDef::default()
+            }),
+        ))
+    }
+
+    /// A closure with the given effects.
+    pub fn closure_with(
+        &mut self,
+        params: &[ParamId],
+        body: ExprId,
+        implicit: Option<CaptureMode>,
+        captures: &[Capture],
+        effects: Effects,
+    ) -> ExprId {
+        let params = self.b.list(params);
+        let captures = self.b.list(captures);
+        self.expr(Expr::Closure(Closure {
+            params,
+            ret: None,
+            body,
+            effects,
+            implicit,
+            captures,
+            self_binder: None,
+            defaults: DefaultEval::PerCall,
+        }))
+    }
+
+    pub fn yield_(&mut self, key: Option<ExprId>, value: Option<ExprId>) -> ExprId {
+        self.expr(Expr::Yield { key, value })
+    }
+
+    pub fn yield_from(&mut self, e: ExprId) -> ExprId {
+        self.expr(Expr::YieldFrom(e))
+    }
+
+    /// A `let_place` alias binder.
+    pub fn place_binder(&mut self, s: &str) -> BinderId {
+        let n = self.name(s);
+        self.b
+            .binder(Binder::new(n, BinderKind::Place).with_mutable(true))
+    }
+
+    pub fn let_place(&mut self, binder: BinderId, place: ExprId, body: ExprId) -> ExprId {
+        self.expr(Expr::LetPlace {
+            binder,
+            place,
+            body,
+        })
+    }
+
+    pub fn ref_assign(&mut self, target: ExprId, source: ExprId) -> ExprId {
+        self.expr(Expr::RefAssign { target, source })
+    }
+
+    /// A positional place argument.
+    pub fn place_arg(&mut self, value: ExprId) -> Arg {
+        Arg {
+            kind: ArgKind::Positional,
+            value,
+            place: true,
+        }
+    }
+
     pub fn ty(&mut self, t: hir_lang::Ty) -> TyId {
         self.tick();
         self.b.ty(t)

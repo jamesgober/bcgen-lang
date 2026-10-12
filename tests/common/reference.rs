@@ -111,6 +111,9 @@ pub const SHIFT: u32 = 3;
 pub const INVALID_CONV: u32 = 4;
 pub const INVALID_CHAR: u32 = 5;
 pub const NULL_REF: u32 = 101;
+pub const NEG_EXPONENT: u32 = 6;
+pub const ARG_ERROR: u32 = 114;
+pub const NO_MATCH: u32 = 200;
 
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -129,12 +132,27 @@ pub struct Interp<'h> {
     pub out: Vec<String>,
     steps: u64,
     depth: usize,
+    /// `let_place` aliases in scope (saved and restored around each body).
+    aliases: HashMap<BinderId, PlaceRef>,
 }
 
 type Env = HashMap<BinderId, Cell>;
 
-/// Evaluated arguments: positional, and named (name, value).
-type Args = (Vec<Av>, Vec<(Vec<u8>, Av)>);
+/// Evaluated arguments, in order: (name for a named one, value).
+type Args = Vec<(Option<Vec<u8>>, Av)>;
+
+/// A place whose operands are evaluated (LSB/HIR `let_place`).
+#[derive(Clone, Debug)]
+pub struct PlaceRef {
+    /// A variable root, looked up when the place is accessed.
+    root_local: Option<BinderId>,
+    /// A global root.
+    root: Option<Cell>,
+    /// A value root.
+    root_val: Option<V>,
+    steps: Vec<Step>,
+    keys: Vec<V>,
+}
 
 fn cell(v: V) -> Cell {
     Rc::new(RefCell::new(v))
@@ -156,6 +174,7 @@ impl<'h> Interp<'h> {
             out: Vec::new(),
             steps: 0,
             depth: 0,
+            aliases: HashMap::new(),
         }
     }
 
@@ -458,6 +477,24 @@ impl<'h> Interp<'h> {
                 self.cast(v, ty, policy, node)
             }
             Expr::Assign { target, op, value } => self.assign(e, target, op, value, env),
+            Expr::LetPlace {
+                binder,
+                place,
+                body,
+            } => {
+                let pr = self.eval_place(place, env)?;
+                let saved = self.aliases.insert(binder, pr);
+                let r = self.eval(body, env);
+                match saved {
+                    Some(old) => {
+                        let _ = self.aliases.insert(binder, old);
+                    }
+                    None => {
+                        let _ = self.aliases.remove(&binder);
+                    }
+                }
+                r
+            }
             Expr::RefAssign { target, source } => {
                 let (Some(t), Some(s)) = (self.local_of(target), self.local_of(source)) else {
                     return Err(Sig::Unspecified);
@@ -491,7 +528,7 @@ impl<'h> Interp<'h> {
                         return self.eval(arm.body, env);
                     }
                 }
-                Ok(V::Nil)
+                err(NO_MATCH, node)
             }
             Expr::Loop { label, body, step } => loop {
                 self.tick()?;
@@ -578,6 +615,10 @@ impl<'h> Interp<'h> {
     fn read_path(&mut self, p: hir_lang::PathId, node: NodeRef, env: &mut Env) -> R<V> {
         let path = *self.hir.path(p);
         match path.res {
+            Res::Local(b) if self.aliases.contains_key(&b) => {
+                let pr = self.aliases.get(&b).cloned().ok_or(Sig::Unspecified)?;
+                self.place_read(&pr, node, env)
+            }
             Res::Local(b) => match env.get(&b) {
                 Some(c) => Ok(c.borrow().clone()),
                 None => Err(Sig::Unspecified),
@@ -775,8 +816,9 @@ impl<'h> Interp<'h> {
                 Res::Def(d) => {
                     if let hir_lang::Def::Item(i) = d.def() {
                         if let ItemKind::Fn(_) = hir.item(i).kind {
-                            let (pos, named) = self.args(args, env, node)?;
-                            return self.invoke(&Func::Item(i), pos, named);
+                            let f = Func::Item(i);
+                            let items = self.args(&f, 0, args, env, node)?;
+                            return self.invoke(&f, items, node);
                         }
                     }
                 }
@@ -795,24 +837,98 @@ impl<'h> Interp<'h> {
         env: &mut Env,
         node: NodeRef,
     ) -> R<V> {
-        let (mut pos, named) = self.args(args, env, node)?;
+        let shift = usize::from(recv.is_some());
+        let func = match &f {
+            V::Func(func) => Some(func.clone()),
+            _ => None,
+        };
+        let mut items = match &func {
+            Some(func) => self.args(func, shift, args, env, node)?,
+            None => self.args(&Func::Item(self.hir.root()), shift, args, env, node)?,
+        };
         if let Some(r) = recv {
-            pos.insert(0, Av::Val(r));
+            items.insert(0, (None, Av::Val(r)));
         }
-        match f {
-            V::Func(func) => self.invoke(&func, pos, named),
-            _ => err(TYPE_ERROR, node),
+        match func {
+            Some(func) => self.invoke(&func, items, node),
+            None => err(TYPE_ERROR, node),
         }
     }
 
-    /// Evaluates arguments: positional values (or a shared variable's cell
-    /// for a place argument), named values, spreads expanded.
-    fn args(&mut self, args: hir_lang::List<Arg>, env: &mut Env, node: NodeRef) -> R<Args> {
+    /// Whether `f` takes the argument at `at` by reference (LSB §5.15's
+    /// `dparam_ref` rule).
+    fn takes_ref(&self, f: &Func, at: Result<usize, &[u8]>) -> bool {
         let hir = self.hir;
-        let mut pos = Vec::new();
-        let mut named = Vec::new();
+        let params: Vec<ParamId> = match f {
+            Func::Item(i) => match hir.item(*i).kind {
+                ItemKind::Fn(def) => hir.list(def.params).to_vec(),
+                _ => return false,
+            },
+            Func::Closure { e, .. } => match *hir.expr(*e) {
+                Expr::Closure(c) => hir.list(c.params).to_vec(),
+                _ => return false,
+            },
+        };
+        let infos: Vec<hir_lang::Param> = params.iter().map(|&p| *hir.param(p)).collect();
+        let rest = infos.iter().find(|p| p.kind == ParamKind::Rest);
+        match at {
+            Ok(pos) => {
+                let positional: Vec<&hir_lang::Param> = infos
+                    .iter()
+                    .filter(|p| matches!(p.kind, ParamKind::PositionalOnly | ParamKind::Normal))
+                    .collect();
+                match positional.get(pos) {
+                    Some(p) => p.by_ref,
+                    None => rest.is_some_and(|p| p.by_ref),
+                }
+            }
+            Err(name) => {
+                let named = infos.iter().enumerate().find(|(i, p)| {
+                    matches!(p.kind, ParamKind::Normal | ParamKind::NamedOnly)
+                        && self.param_name(params[*i]).as_deref() == Some(name)
+                });
+                match named {
+                    Some((_, p)) => p.by_ref,
+                    None => match infos.iter().find(|p| p.kind == ParamKind::RestNamed) {
+                        Some(p) => p.by_ref,
+                        None => rest.is_some_and(|p| p.by_ref),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Evaluates arguments in order (spreads flattened, LSB §5.15 step 2).
+    /// A place argument naming a shared variable passes the variable when
+    /// `f` takes that argument by reference, else its value now; after a
+    /// spread, positions are unknown and place arguments go by value.
+    fn args(
+        &mut self,
+        f: &Func,
+        shift: usize,
+        args: hir_lang::List<Arg>,
+        env: &mut Env,
+        node: NodeRef,
+    ) -> R<Args> {
+        let hir = self.hir;
+        let mut items: Args = Vec::new();
+        let mut pos = shift;
+        let mut spread = false;
         for a in hir.list(args) {
-            let place = if a.place {
+            let at = match a.kind {
+                ArgKind::Positional => {
+                    pos += 1;
+                    (!spread).then_some(Ok(pos - 1))
+                }
+                ArgKind::Named(id) => Some(Err(self.text(id.sym).into_bytes())),
+                _ => None,
+            };
+            let by_ref = match &at {
+                Some(Ok(p)) => self.takes_ref(f, Ok(*p)),
+                Some(Err(n)) => self.takes_ref(f, Err(n.as_slice())),
+                None => false,
+            };
+            let place = if a.place && by_ref {
                 match *hir.expr(a.value) {
                     Expr::Path(p) => match hir.path(p).res {
                         Res::Local(b) => env.get(&b).cloned(),
@@ -827,34 +943,37 @@ impl<'h> Interp<'h> {
                 None
             };
             match a.kind {
-                ArgKind::Positional => match place {
-                    Some(c) => pos.push(Av::Cell(c)),
-                    None => {
-                        let v = self.eval(a.value, env)?;
-                        pos.push(Av::Val(self.copy(&v)));
-                    }
-                },
-                ArgKind::Named(id) => {
-                    let n = self.text(id.sym).into_bytes();
+                ArgKind::Positional | ArgKind::Named(_) => {
+                    let name = match a.kind {
+                        ArgKind::Named(id) => Some(self.text(id.sym).into_bytes()),
+                        _ => None,
+                    };
                     match place {
-                        Some(c) => named.push((n, Av::Cell(c))),
+                        Some(c) => items.push((name, Av::Cell(c))),
                         None => {
                             let v = self.eval(a.value, env)?;
-                            named.push((n, Av::Val(self.copy(&v))));
+                            items.push((name, Av::Val(self.copy(&v))));
                         }
                     }
                 }
                 ArgKind::Spread => {
+                    spread = true;
                     let v = self.eval(a.value, env)?;
                     let V::Map(m) = v else {
                         return err(TYPE_ERROR, node);
                     };
                     let entries = m.borrow().entries.clone();
-                    for (_, x) in entries {
-                        pos.push(Av::Val(self.copy(&x)));
+                    for (k, x) in entries {
+                        let name = match k {
+                            Key::Int(_) => None,
+                            Key::Str(s) => Some(s),
+                            _ => return err(ARG_ERROR, node),
+                        };
+                        items.push((name, Av::Val(self.copy(&x))));
                     }
                 }
                 ArgKind::SpreadNamed => {
+                    spread = true;
                     let v = self.eval(a.value, env)?;
                     let V::Map(m) = v else {
                         return err(TYPE_ERROR, node);
@@ -862,28 +981,28 @@ impl<'h> Interp<'h> {
                     let entries = m.borrow().entries.clone();
                     for (k, x) in entries {
                         let Key::Str(s) = k else {
-                            return err(TYPE_ERROR, node);
+                            return err(ARG_ERROR, node);
                         };
-                        named.push((s, Av::Val(self.copy(&x))));
+                        items.push((Some(s), Av::Val(self.copy(&x))));
                     }
                 }
             }
         }
-        Ok((pos, named))
+        Ok(items)
     }
 
-    fn invoke(&mut self, f: &Func, pos: Vec<Av>, named: Vec<(Vec<u8>, Av)>) -> R<V> {
+    fn invoke(&mut self, f: &Func, items: Args, call: NodeRef) -> R<V> {
         self.depth += 1;
         if self.depth > 200 {
             self.depth -= 1;
             return Err(Sig::Budget);
         }
-        let r = self.invoke_inner(f, pos, named);
+        let r = self.invoke_inner(f, items, call);
         self.depth -= 1;
         r
     }
 
-    fn invoke_inner(&mut self, f: &Func, pos: Vec<Av>, named: Vec<(Vec<u8>, Av)>) -> R<V> {
+    fn invoke_inner(&mut self, f: &Func, items: Args, call: NodeRef) -> R<V> {
         let hir = self.hir;
         let (params, body, node, defaults, item): (
             Vec<ParamId>,
@@ -923,7 +1042,7 @@ impl<'h> Interp<'h> {
                     .unwrap_or_default(),
                 _ => String::new(),
             };
-            let vs: Vec<V> = pos.iter().map(Av::value).collect();
+            let vs: Vec<V> = items.iter().map(|(_, a)| a.value()).collect();
             return self.host(&name, &vs, node);
         };
         let mut env = Env::new();
@@ -945,7 +1064,7 @@ impl<'h> Interp<'h> {
                 }
             }
         }
-        // Bind arguments.
+        // Bind arguments (LSB §5.15 step 3: errors at the call).
         let infos: Vec<hir_lang::Param> = params.iter().map(|&p| *hir.param(p)).collect();
         let mut vals: Vec<Option<Av>> = vec![None; params.len()];
         let positional: Vec<usize> = (0..infos.len())
@@ -953,31 +1072,56 @@ impl<'h> Interp<'h> {
             .collect();
         let rest = infos.iter().position(|p| p.kind == ParamKind::Rest);
         let rest_named = infos.iter().position(|p| p.kind == ParamKind::RestNamed);
-        let mut extra = Vec::new();
-        for (k, a) in pos.into_iter().enumerate() {
-            match positional.get(k) {
-                Some(&j) => vals[j] = Some(a),
-                None => extra.push(a),
-            }
-        }
-        if !extra.is_empty() && rest.is_none() {
-            return err(TYPE_ERROR, node);
-        }
-        let mut rest_named_vals = Vec::new();
-        for (n, a) in named {
-            let j = infos.iter().enumerate().position(|(i, p)| {
-                matches!(p.kind, ParamKind::Normal | ParamKind::NamedOnly)
-                    && self.param_name(params[i]).as_deref() == Some(n.as_slice())
-            });
-            match j {
-                Some(j) => {
-                    if vals[j].is_some() {
-                        return err(TYPE_ERROR, node);
+        let rest_map = Rc::new(RefCell::new(MapData::default()));
+        let named_map = Rc::new(RefCell::new(MapData::default()));
+        let mut next = 0usize;
+        let mut named_seen = false;
+        for (name, a) in items {
+            match name {
+                None => {
+                    if named_seen {
+                        return err(ARG_ERROR, call);
                     }
-                    vals[j] = Some(a);
+                    match positional.get(next) {
+                        Some(&j) => {
+                            next += 1;
+                            vals[j] = Some(a);
+                        }
+                        None if rest.is_some() => {
+                            let v = a.value();
+                            map_push(&rest_map, self.copy(&v), call)?;
+                        }
+                        None => return err(ARG_ERROR, call),
+                    }
                 }
-                None if rest_named.is_some() => rest_named_vals.push((n, a)),
-                None => return err(TYPE_ERROR, node),
+                Some(n) => {
+                    named_seen = true;
+                    let j = infos.iter().enumerate().position(|(i, p)| {
+                        matches!(p.kind, ParamKind::Normal | ParamKind::NamedOnly)
+                            && self.param_name(params[i]).as_deref() == Some(n.as_slice())
+                    });
+                    match j {
+                        Some(j) => {
+                            if vals[j].is_some() {
+                                return err(ARG_ERROR, call);
+                            }
+                            vals[j] = Some(a);
+                        }
+                        None => {
+                            let into = match (rest_named, rest) {
+                                (Some(_), _) => &named_map,
+                                (None, Some(_)) => &rest_map,
+                                (None, None) => return err(ARG_ERROR, call),
+                            };
+                            let key = Key::Str(n);
+                            if map_find(into, &key).is_some() {
+                                return err(ARG_ERROR, call);
+                            }
+                            let v = a.value();
+                            map_set(into, key, self.copy(&v));
+                        }
+                    }
+                }
             }
         }
         for (i, p) in infos.iter().enumerate() {
@@ -985,24 +1129,14 @@ impl<'h> Interp<'h> {
                 && p.default.is_none()
                 && !matches!(p.kind, ParamKind::Rest | ParamKind::RestNamed)
             {
-                return err(TYPE_ERROR, node);
+                return err(ARG_ERROR, call);
             }
         }
         if let Some(r) = rest {
-            let m = Rc::new(RefCell::new(MapData::default()));
-            for a in extra {
-                let v = a.value();
-                map_push(&m, self.copy(&v), node)?;
-            }
-            vals[r] = Some(Av::Val(V::Map(m)));
+            vals[r] = Some(Av::Val(V::Map(rest_map)));
         }
         if let Some(r) = rest_named {
-            let m = Rc::new(RefCell::new(MapData::default()));
-            for (n, a) in rest_named_vals {
-                let v = a.value();
-                map_set(&m, Key::Str(n), self.copy(&v));
-            }
-            vals[r] = Some(Av::Val(V::Map(m)));
+            vals[r] = Some(Av::Val(V::Map(named_map)));
         }
         // Defaults and patterns, in order.
         for (i, &pid) in params.iter().enumerate() {
@@ -1150,145 +1284,151 @@ impl<'h> Interp<'h> {
         env: &mut Env,
     ) -> R<V> {
         let node = NodeRef::Expr(e);
-        let hir = self.hir;
-        // Decompose the target.
-        let mut steps: Vec<Step> = Vec::new();
-        let mut cur = target;
-        // A variable root is looked up when it is read or written (after the
-        // value: a reference assignment in the value may rebind it).
-        let mut root_local: Option<BinderId> = None;
-        let root: Option<Cell> = loop {
-            match *hir.expr(cur) {
-                Expr::Index { base, index } => {
-                    steps.push(Step::Index(index));
-                    cur = base;
-                }
-                Expr::DynField { base, name } => {
-                    steps.push(Step::Dyn(name));
-                    cur = base;
-                }
-                Expr::Field { base, member, .. } => {
-                    steps.push(match member {
-                        Member::Named(s) => Step::Prop(self.text(s).into_bytes()),
-                        Member::Index(i) => Step::Elem(i),
-                    });
-                    cur = base;
-                }
-                Expr::Append(base) => {
-                    steps.push(Step::Append);
-                    cur = base;
-                }
-                Expr::Path(p) => {
-                    let res = hir.path(p).res;
-                    match res {
-                        Res::Local(b) => {
-                            root_local = Some(b);
-                            break env.get(&b).cloned();
-                        }
-                        _ => match self.global_cell(res) {
-                            Some(c) if !matches!(hir.item_kind_of(res), Some(true)) => {
-                                break Some(c);
-                            }
-                            _ => break None,
-                        },
-                    }
-                }
-                _ => break None,
-            }
-        };
-        steps.reverse();
-        // A non-variable root is a value.
-        let root_val = if root.is_none() {
-            Some(self.eval(cur, env)?)
-        } else {
-            None
-        };
-        // Keys, in order.
-        let mut keys: Vec<V> = Vec::new();
-        for s in &steps {
-            match s {
-                Step::Index(k) => {
-                    let v = self.eval(*k, env)?;
-                    keys.push(self.coerce_key(v));
-                }
-                Step::Dyn(k) => keys.push(self.eval(*k, env)?),
-                _ => {}
-            }
-        }
-        let lookup = |env: &Env, root: &Option<Cell>| match root_local {
-            Some(b) => env.get(&b).cloned(),
-            None => root.clone(),
-        };
-        if steps.is_empty() {
-            let v = match op {
-                Some(op) => {
-                    let old = lookup(env, &root)
-                        .map(|c| c.borrow().clone())
-                        .unwrap_or(V::Nil);
-                    let v = self.eval(value, env)?;
-                    self.op(op, &[old, v], node)?
-                }
-                None => {
-                    let v = self.eval(value, env)?;
-                    self.copy(&v)
-                }
-            };
-            let Some(rc) = lookup(env, &root) else {
-                return Err(Sig::Unspecified);
-            };
-            *rc.borrow_mut() = v.clone();
-            return Ok(v);
-        }
+        let pr = self.eval_place(target, env)?;
         let v = match op {
             Some(op) => {
-                // Read the old value through the chain.
-                let root = lookup(env, &root);
-                let mut cur = match (&root, &root_val) {
-                    (Some(c), _) => c.borrow().clone(),
-                    (None, Some(v)) => v.clone(),
-                    _ => V::Nil,
-                };
-                let mut ki = 0;
-                for s in &steps {
-                    cur = match s {
-                        Step::Index(_) | Step::Dyn(_) => {
-                            let k = keys[ki].clone();
-                            ki += 1;
-                            self.get_index(&cur, &k, node)?
-                        }
-                        Step::Elem(i) => self.get_index(&cur, &V::Int(i64::from(*i)), node)?,
-                        Step::Prop(n) => self.get_prop(&cur, n, node)?,
-                        Step::Append => return Err(Sig::Unspecified),
-                    };
-                }
+                let old = self.place_read(&pr, node, env)?;
                 let v = self.eval(value, env)?;
-                self.op(op, &[cur, v], node)?
+                self.op(op, &[old, v], node)?
             }
             None => {
                 let v = self.eval(value, env)?;
                 self.copy(&v)
             }
         };
-        // Write.
-        let php = self.cfg.php_arrays;
-        let root = lookup(env, &root);
-        let mut cur = match (&root, &root_val) {
+        self.place_write(&pr, v.clone(), node, env)?;
+        Ok(v)
+    }
+
+    /// Evaluates a place's operands (root value, then keys, in order); a
+    /// `let_place` alias in the chain contributes its own.
+    fn eval_place(&mut self, target: ExprId, env: &mut Env) -> R<PlaceRef> {
+        let hir = self.hir;
+        let mut steps: Vec<Step> = Vec::new();
+        let mut key_exprs: Vec<(ExprId, bool)> = Vec::new();
+        let mut cur = target;
+        let mut base = PlaceRef {
+            root_local: None,
+            root: None,
+            root_val: None,
+            steps: Vec::new(),
+            keys: Vec::new(),
+        };
+        let mut value_root = false;
+        loop {
+            match *hir.expr(cur) {
+                Expr::Index { base: b, index } => {
+                    steps.push(Step::Index);
+                    key_exprs.push((index, true));
+                    cur = b;
+                }
+                Expr::DynField { base: b, name } => {
+                    steps.push(Step::Dyn);
+                    key_exprs.push((name, false));
+                    cur = b;
+                }
+                Expr::Field {
+                    base: b, member, ..
+                } => {
+                    steps.push(match member {
+                        Member::Named(s) => Step::Prop(self.text(s).into_bytes()),
+                        Member::Index(i) => Step::Elem(i),
+                    });
+                    cur = b;
+                }
+                Expr::Append(b) => {
+                    steps.push(Step::Append);
+                    cur = b;
+                }
+                Expr::Path(p) => {
+                    let res = hir.path(p).res;
+                    match res {
+                        Res::Local(b) if self.aliases.contains_key(&b) => {
+                            base = self.aliases.get(&b).cloned().ok_or(Sig::Unspecified)?;
+                        }
+                        Res::Local(b) => base.root_local = Some(b),
+                        _ => match self.global_cell(res) {
+                            Some(c) if !matches!(hir.item_kind_of(res), Some(true)) => {
+                                base.root = Some(c);
+                            }
+                            _ => value_root = true,
+                        },
+                    }
+                    break;
+                }
+                _ => {
+                    value_root = true;
+                    break;
+                }
+            }
+        }
+        steps.reverse();
+        key_exprs.reverse();
+        if value_root {
+            base.root_val = Some(self.eval(cur, env)?);
+        }
+        for (k, index) in key_exprs {
+            let v = self.eval(k, env)?;
+            base.keys.push(if index { self.coerce_key(v) } else { v });
+        }
+        base.steps.extend(steps);
+        Ok(base)
+    }
+
+    /// The current root value of a place.
+    fn place_root(&self, pr: &PlaceRef, env: &Env) -> (Option<Cell>, V) {
+        let cell = match pr.root_local {
+            Some(b) => env.get(&b).cloned(),
+            None => pr.root.clone(),
+        };
+        let v = match (&cell, &pr.root_val) {
             (Some(c), _) => c.borrow().clone(),
             (None, Some(v)) => v.clone(),
             _ => V::Nil,
         };
+        (cell, v)
+    }
+
+    fn place_read(&mut self, pr: &PlaceRef, node: NodeRef, env: &mut Env) -> R<V> {
+        let (_, mut cur) = self.place_root(pr, env);
+        let mut ki = 0;
+        for s in &pr.steps {
+            cur = match s {
+                Step::Index | Step::Dyn => {
+                    let k = pr.keys[ki].clone();
+                    ki += 1;
+                    self.get_index(&cur, &k, node)?
+                }
+                Step::Elem(i) => self.get_index(&cur, &V::Int(i64::from(*i)), node)?,
+                Step::Prop(n) => self.get_prop(&cur, n, node)?,
+                Step::Append => return Err(Sig::Unspecified),
+            };
+        }
+        Ok(cur)
+    }
+
+    fn place_write(&mut self, pr: &PlaceRef, v: V, node: NodeRef, env: &mut Env) -> R<()> {
+        let php = self.cfg.php_arrays;
+        let (root, mut cur) = self.place_root(pr, env);
+        if pr.steps.is_empty() {
+            let Some(rc) = root else {
+                return Err(Sig::Unspecified);
+            };
+            *rc.borrow_mut() = v;
+            return Ok(());
+        }
         if php && matches!(cur, V::Nil) {
             cur = V::Map(Rc::new(RefCell::new(MapData::default())));
             if let Some(c) = &root {
                 *c.borrow_mut() = cur.clone();
             }
         }
-        let last = steps.len() - 1;
+        let last = pr.steps.len() - 1;
         let mut ki = 0;
-        for (i, s) in steps.iter().enumerate() {
+        for (i, s) in pr.steps.iter().enumerate() {
             let key: Option<V> = match s {
-                Step::Index(_) | Step::Dyn(_) => {
-                    let k = keys[ki].clone();
+                Step::Index | Step::Dyn => {
+                    let k = pr.keys[ki].clone();
                     ki += 1;
                     Some(k)
                 }
@@ -1344,7 +1484,7 @@ impl<'h> Interp<'h> {
                 };
             }
         }
-        Ok(v)
+        Ok(())
     }
 
     // ------------------------------------------------------------ access
@@ -1598,6 +1738,22 @@ impl<'h> Interp<'h> {
         }
         let prim = match *hir.ty(ty) {
             Ty::Any | Ty::Infer => return Ok(true),
+            Ty::Union(ms) => {
+                for &m in hir.list(ms) {
+                    if self.type_ok(m, v)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+            Ty::Intersection(ms) => {
+                for &m in hir.list(ms) {
+                    if !self.type_ok(m, v)? {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
             Ty::Tuple(_) | Ty::Array { .. } | Ty::Slice(_) => return Ok(matches!(v, V::Map(_))),
             Ty::Prim(p) => p,
             Ty::Path(p) => match hir.path(p).res {
@@ -1650,17 +1806,26 @@ impl<'h> Interp<'h> {
                 })),
                 _ => err(TYPE_ERROR, node),
             },
-            K::Not => match x {
-                V::Bool(b) => Ok(V::Bool(!b)),
+            K::Not => Ok(V::Bool(!Self::truthy(&x))),
+            K::BitNot => match x {
                 V::Int(i) => Ok(V::Int(!i)),
                 _ => err(TYPE_ERROR, node),
             },
+            K::Pow => pow(&x, &y, over, node),
             K::Shl | K::Shr => match (&x, &y) {
                 (V::Int(a), V::Int(n)) => {
                     let n = if *n < 0 || *n >= 64 {
                         match sh {
                             hir_lang::Shift::Error => return err(SHIFT, node),
                             hir_lang::Shift::Mask => n & 63,
+                            hir_lang::Shift::Saturate if *n < 0 => return err(SHIFT, node),
+                            hir_lang::Shift::Saturate => {
+                                return Ok(V::Int(if op.kind == K::Shl || *a >= 0 {
+                                    0
+                                } else {
+                                    -1
+                                }));
+                            }
                         }
                     } else {
                         *n
@@ -1842,6 +2007,13 @@ impl<'h> Interp<'h> {
         }
         let p = match *hir.ty(ty) {
             Ty::Any | Ty::Infer => return Ok(v),
+            Ty::Union(_) | Ty::Intersection(_) => {
+                return if self.type_ok(ty, &v)? {
+                    Ok(v)
+                } else {
+                    err(TYPE_ERROR, node)
+                };
+            }
             Ty::Prim(p) => p,
             _ => return Err(Sig::Unspecified),
         };
@@ -1973,9 +2145,10 @@ impl Av {
     }
 }
 
-enum Step {
-    Index(ExprId),
-    Dyn(ExprId),
+#[derive(Clone, Debug)]
+pub enum Step {
+    Index,
+    Dyn,
     Prop(Vec<u8>),
     Elem(u32),
     Append,
@@ -2426,5 +2599,61 @@ pub fn to_rv(v: &V, depth: usize) -> RV {
         V::Func(_) => RV::Func,
         V::Error(c, _) => RV::Error(*c),
         V::Iter(_) => RV::Other(11),
+    }
+}
+
+/// OPS v2 `pow` on dynamic values (LSB `dpow`). Results the oracle cannot
+/// compute exactly (a float power, or a promoted power beyond `i128`) are
+/// unspecified: the float routine is the family's `ls_pow`, which the VM
+/// tests itself.
+fn pow(x: &V, y: &V, over: Overflow, node: NodeRef) -> R<V> {
+    match (x, y) {
+        (V::Int(b), V::Int(e)) if *e >= 0 && matches!(*b, -1..=1) => Ok(V::Int(match *b {
+            0 if *e == 0 => 1,
+            -1 if *e % 2 == 1 => -1,
+            -1 => 1,
+            b => b,
+        })),
+        (V::Int(_), V::Int(e)) if *e < 0 => match over {
+            Overflow::Promote => Err(Sig::Unspecified),
+            _ => err(NEG_EXPONENT, node),
+        },
+        (V::Int(b), V::Int(e)) => {
+            let exact = u32::try_from(*e)
+                .ok()
+                .and_then(|e| i128::from(*b).checked_pow(e));
+            match exact {
+                Some(r) => match i64::try_from(r) {
+                    Ok(v) => Ok(V::Int(v)),
+                    Err(_) => match over {
+                        Overflow::Wrap => Ok(V::Int(b.wrapping_pow(*e as u32))),
+                        Overflow::Promote => Ok(V::Float(r as f64)),
+                        Overflow::Trap => Err(Sig::Trap(ARITH_OVERFLOW, node)),
+                        Overflow::Error => err(ARITH_OVERFLOW, node),
+                    },
+                },
+                // |b| >= 2 with a huge exponent: does not fit.
+                None => match over {
+                    Overflow::Wrap => {
+                        let mut acc: i64 = 1;
+                        let mut base = *b;
+                        let mut n = *e as u64;
+                        while n > 0 {
+                            if n & 1 == 1 {
+                                acc = acc.wrapping_mul(base);
+                            }
+                            base = base.wrapping_mul(base);
+                            n >>= 1;
+                        }
+                        Ok(V::Int(acc))
+                    }
+                    Overflow::Promote => Err(Sig::Unspecified),
+                    Overflow::Trap => Err(Sig::Trap(ARITH_OVERFLOW, node)),
+                    Overflow::Error => err(ARITH_OVERFLOW, node),
+                },
+            }
+        }
+        (V::Int(_) | V::Float(_), V::Int(_) | V::Float(_)) => Err(Sig::Unspecified),
+        _ => err(TYPE_ERROR, node),
     }
 }

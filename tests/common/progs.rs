@@ -328,6 +328,7 @@ impl Gen {
             OpKind::Xor,
             OpKind::Shl,
             OpKind::Shr,
+            OpKind::Pow,
             OpKind::Eq,
             OpKind::Ne,
             OpKind::Lt,
@@ -363,11 +364,7 @@ impl Gen {
             op = op.with_div_zero(d);
         }
         if op.policy.shift.is_some() {
-            let s = if self.r.chance(50) {
-                Shift::Mask
-            } else {
-                Shift::Error
-            };
+            let s = self.r.pick(&[Shift::Mask, Shift::Error, Shift::Saturate]);
             op = op.with_shift(s);
         }
         op
@@ -417,6 +414,7 @@ impl Gen {
                 let k = self.r.pick(&[
                     OpKind::Neg,
                     OpKind::Not,
+                    OpKind::BitNot,
                     OpKind::Abs,
                     OpKind::Sqrt,
                     OpKind::Floor,
@@ -701,6 +699,25 @@ impl Gen {
             }
         };
         let v = self.expr(cx, d);
+        if (2..4).contains(&shape) && self.r.chance(40) {
+            // let_place p = target in p = op(p, v) (or concat): the place's
+            // operands evaluated once.
+            let n = self.fresh("p");
+            let p = self.h.place_binder(&n);
+            let vp = self.h.var(p);
+            let combined = if self.r.chance(30) {
+                self.h.intrinsic("concat", &[vp, v])
+            } else {
+                let k = self
+                    .r
+                    .pick(&[OpKind::Add, OpKind::Sub, OpKind::Pow, OpKind::Or]);
+                let op = self.policy(Op::new(k));
+                self.h.op_with(op, &[vp, v])
+            };
+            let tp = self.h.var(p);
+            let body = self.h.assign(tp, combined);
+            return self.h.let_place(p, target, body);
+        }
         if shape < 4 && self.r.chance(30) {
             let k = self.r.pick(&[
                 OpKind::Add,
@@ -862,10 +879,18 @@ impl Gen {
                 self.h.pat(Pat::Or(l))
             }
             7 => {
-                let p = self
-                    .r
-                    .pick(&[Prim::I64, Prim::F64, Prim::Str, Prim::Bool, Prim::Char]);
+                let prims = [Prim::I64, Prim::F64, Prim::Str, Prim::Bool, Prim::Char];
+                let p = self.r.pick(&prims);
                 let ty = self.h.ty(Ty::Prim(p));
+                let ty = if self.r.chance(30) {
+                    // A union of two primitives (canonicalized by `finish`).
+                    let q = self.r.pick(&prims);
+                    let other = self.h.ty(Ty::Prim(q));
+                    let members = self.h.b.list(&[ty, other]);
+                    self.h.ty(Ty::Union(members))
+                } else {
+                    ty
+                };
                 let ty = if self.r.chance(25) {
                     self.h.ty(Ty::Nullable(ty))
                 } else {

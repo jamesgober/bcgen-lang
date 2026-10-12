@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bcgen-lang"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -52,10 +52,10 @@ std = ["hir-lang/std", "bytecode-lang/std", "intern-lang/std"]
 # DEPENDENCIES
 # #################################
 [dependencies]
-# The input: HIR (spec v2) with its ids, origins, binders, and traversal.
-hir-lang = { version = "0.3", default-features = false }
-# The output: LSB modules, built with label-resolving function builders.
-bytecode-lang = { version = "0.2", default-features = false }
+# The input: HIR (spec v3) with its ids, origins, binders, and traversal.
+hir-lang = { version = "0.4", default-features = false }
+# The output: LSB format 2 modules, built with label-resolving function builders.
+bytecode-lang = { version = "0.3", default-features = false }
 # Symbol text (function, import, field, and local names) through the interner's
 # read contract `Lookup`; the same major version hir-lang uses.
 intern-lang = { version = "1", default-features = false }
@@ -67,9 +67,7 @@ intern-lang = { version = "1", default-features = false }
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 # Executes what the compiler emits: the differential, end-to-end, and load tests.
-bvm-lang = "=2.0.0-alpha.1"
-# End-to-end: resolve a hand-lowered unit before compiling it.
-resolve-lang = "0.2"
+bvm-lang = "=2.0.0-alpha.3"
 
 
 # BENCHMARKS

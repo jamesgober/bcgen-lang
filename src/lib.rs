@@ -36,20 +36,28 @@
 //!
 //! ## What it compiles
 //!
-//! The **dynamic profile**: every value is an LSB `dyn`. Functions with
-//! defaults (per call or once), named, variadic, and by-reference
-//! parameters; locals in registers, shared variables in cells; closures with
-//! explicit, implicit, and recursive captures; `if`, the loop primitive with
-//! its step, labeled `break`/`continue`, `return`; `match` by a sequential
-//! decision procedure; direct, dynamic, host, and method calls; maps and
-//! arrays with PHP value semantics and key coercion (or shared references);
-//! every OPS operation with its policy, `promote` included; `throw` and
+//! HIR spec v3 (hir-lang 0.4) to LSB format 2 (bytecode-lang 0.3), in the
+//! **dynamic profile**: every value is an LSB `dyn`. Functions with defaults
+//! (per call or once), named, variadic, and by-reference parameters, each
+//! carrying its LSB parameter list so dynamic calls bind in the VM; locals in
+//! registers, shared variables in LSB references; closures with explicit,
+//! implicit, and recursive captures; generators (keyed `yield`, `yield
+//! from`), `await`, and `spawn`; `if`, the loop primitive with its step,
+//! labeled `break`/`continue`, `return`; `match` by a sequential decision
+//! procedure, raising `NoMatch` when no arm matches; direct, dynamic, host,
+//! and method calls; maps and arrays with PHP value semantics, separation
+//! that copies only what is shared, and key coercion (or shared references);
+//! `let_place` and PHP references into array elements; every OPS v2
+//! operation with its policy (`pow`, `promote`, `shift = saturate`);
+//! union and intersection type tests and casts; `throw` and
 //! `try`/`catch`/`finally` by LSB's canonical lowering, `defer`; globals,
-//! constants, statics, and the module body. Every instruction maps back to
-//! the HIR node it came from ([`Compiled::origin`]) and to a line-table row.
+//! constants, statics, and the module body; named intrinsics through an
+//! [`Intrinsics`] table ([`Intrinsics::mox`] maps every Mox intrinsic to an
+//! inline fast path or a host function). Every instruction maps back to the
+//! HIR node it came from ([`Compiled::origin`]) and to a line-table row.
 //!
-//! Not yet: coroutines, classes, declared records and sums, and typed fast
-//! paths (0.5); each is a precise [`CompileError::Unsupported`].
+//! Not yet: classes, declared records and sums, and typed fast paths (0.5);
+//! each is a precise [`CompileError::Unsupported`].
 //!
 //! ## Guarantees
 //!
@@ -88,20 +96,23 @@ mod analysis;
 mod codegen;
 mod error;
 mod func;
+mod intrinsics;
 mod options;
 mod output;
 mod unit;
 
 pub use error::{CompileError, Unsupported};
+pub use intrinsics::{Arity, Fast, IntrinsicDef, Intrinsics, Lowering, LsbOp};
 pub use options::{ArraySemantics, BodyMode, KeyCoercion, LineIndex, Locate, Location, Options};
 pub use output::Compiled;
 
-/// Compiles and runs the `rust` code blocks in `README.md` and `docs/API.md`
-/// as part of `cargo test`, so the published examples cannot drift from the
-/// API.
+/// Compiles and runs the `rust` code blocks in `README.md`, `docs/API.md`,
+/// and the current release notes as part of `cargo test`, so the published
+/// examples cannot drift from the API.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 #[doc = include_str!("../docs/API.md")]
+#[doc = include_str!("../docs/release/v0.3.0.md")]
 pub struct MarkdownDocTests;
 
 use hir_lang::Hir;

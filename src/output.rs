@@ -120,10 +120,13 @@ impl Compiled {
         self.result
     }
 
-    /// The direct-call function compiled for a HIR function item: its
-    /// parameters are `dyn` (a by-reference parameter is a cell), followed by
-    /// an `i64` presence mask when any parameter has a default; it returns
-    /// `dyn`. Root-level functions are exported under their names.
+    /// The function compiled for a HIR function item: its parameters are
+    /// `dyn` (a by-reference parameter is a `ref cell dyn` holding an LSB
+    /// reference), followed by an `i64` presence mask when any parameter has
+    /// a default; it returns `dyn` (a generator's returns its coroutine). It
+    /// carries the item's LSB parameter list, so it can be called typed
+    /// (`call`, `Vm::run`) or bound dynamically. Root-level functions are
+    /// exported under their names.
     ///
     /// # Examples
     ///

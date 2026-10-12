@@ -50,6 +50,72 @@ fn the_generator_covers_every_outcome() {
     assert!(open < n / 4, "open {open}");
 }
 
+/// The generator reaches the 0.3 forms: `let_place`, `pow`, `bit_not`,
+/// saturating shifts, and union type tests.
+#[test]
+fn the_generator_reaches_the_0_3_forms() {
+    use hir_lang::{Expr, IdKind, OpKind, Pat, Ty};
+    let (mut let_place, mut pow, mut bit_not, mut saturate, mut union) = (0, 0, 0, 0, 0);
+    for seed in 0..1000u64 {
+        let (hir, _) = progs::program(seed);
+        for i in 0..hir.count(IdKind::Expr) {
+            let Some(e) = hir_lang::ExprId::from_index(i) else {
+                continue;
+            };
+            match *hir.expr(e) {
+                Expr::LetPlace { .. } => let_place += 1,
+                Expr::Op { op, .. } => {
+                    pow += usize::from(op.kind == OpKind::Pow);
+                    bit_not += usize::from(op.kind == OpKind::BitNot);
+                    saturate += usize::from(op.policy.shift == Some(hir_lang::Shift::Saturate));
+                }
+                _ => {}
+            }
+        }
+        for i in 0..hir.count(IdKind::Pat) {
+            let Some(p) = hir_lang::PatId::from_index(i) else {
+                continue;
+            };
+            if let Pat::TypeTest { ty, .. } = *hir.pat(p) {
+                let inner = match *hir.ty(ty) {
+                    Ty::Nullable(t) => t,
+                    _ => ty,
+                };
+                union += usize::from(matches!(hir.ty(inner), Ty::Union(_)));
+            }
+        }
+    }
+    println!("let_place {let_place} pow {pow} bit_not {bit_not} saturate {saturate} union {union}");
+    for (name, n) in [
+        ("let_place", let_place),
+        ("pow", pow),
+        ("bit_not", bit_not),
+        ("saturate", saturate),
+        ("union", union),
+    ] {
+        assert!(n >= 20, "{name}: {n}");
+    }
+}
+
+/// A long run over consecutive seeds (`BCGEN_SEEDS=1000000 BCGEN_START=0
+/// cargo test --release --test differential many_seeds -- --ignored`).
+#[test]
+#[ignore = "a long run"]
+fn many_seeds() {
+    let n: u64 = std::env::var("BCGEN_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+    let start: u64 = std::env::var("BCGEN_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    for seed in start..start + n {
+        let r = std::panic::catch_unwind(|| run(seed));
+        assert!(r.is_ok(), "seed {seed} disagrees");
+    }
+}
+
 /// Seeds that once disagreed, kept as regressions (each found a real bug):
 /// a positional argument overwriting a named one in static arrangement; a
 /// value-less `break` out of a labeled block; a block returning its own

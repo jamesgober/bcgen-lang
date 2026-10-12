@@ -3,7 +3,9 @@
 use core::fmt;
 
 use bytecode_lang::BuildError;
-use hir_lang::{NodeRef, Span};
+use hir_lang::{NodeRef, Span, Symbol};
+
+use crate::intrinsics::Arity;
 
 /// A HIR form this release does not compile, named precisely.
 ///
@@ -16,14 +18,11 @@ use hir_lang::{NodeRef, Span};
 /// ```
 /// use bcgen_lang::Unsupported;
 ///
-/// assert!(Unsupported::Coroutine.to_string().contains("0.5"));
+/// assert!(Unsupported::Class.to_string().contains("0.5"));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Unsupported {
-    /// `yield`, `await`, `spawn`, or a function or closure declared `ASYNC` or
-    /// `YIELD` (coroutines arrive in 0.5, with bvm-lang's coroutine group).
-    Coroutine,
     /// Classes, impls, interfaces with bodies, mixins, and receiver parameters
     /// (0.5).
     Class,
@@ -32,16 +31,18 @@ pub enum Unsupported {
     /// 0.5; anonymous records compile, as maps).
     Record,
     /// `*e`, `&e`, a `ref` pattern, or binding by reference: the dynamic
-    /// profile has no reference values.
+    /// profile has no pointer values (PHP references are places, see
+    /// [`RefPlace`](Unsupported::RefPlace)).
     Reference,
-    /// A reference assignment or by-reference argument whose place is not a
-    /// local variable (an array element, a property, a global alias). LSB has
-    /// no reference to a map slot; only whole variables can be shared.
+    /// A reference (`&`) to a place LSB cannot reference: an appended
+    /// element (`&$a[]`, whose key is known only after the append), a
+    /// variable variable, or a value that is not a place.
     RefPlace,
     /// `$$name`: LSB frames have no names at run time.
     VarVar,
-    /// An atomic, volatile, or fence intrinsic, or a named intrinsic this
-    /// release does not know.
+    /// An atomic, volatile, or fence intrinsic (native backends only; named
+    /// intrinsics compile through the [`Intrinsics`](crate::Intrinsics)
+    /// table).
     Intrinsic,
     /// Inline assembly (native backends only).
     Asm,
@@ -53,11 +54,13 @@ pub enum Unsupported {
     /// A path resolved only by type (`Vec::new`), or naming a primitive,
     /// type parameter, or const parameter as a value (typed paths, 0.5).
     TypeDirected,
-    /// A host function used as a value rather than called: LSB imports have a
-    /// fixed arity, which a first-class value does not know.
+    /// A host function used as a value rather than called: the compiler does
+    /// not know the host function's parameter list, which a first-class
+    /// value needs (LSB §5.15).
     ExternValue,
-    /// Spread, named, or by-reference arguments to a host function, or a
-    /// bodyless function with defaults: imports take exactly their parameters.
+    /// Spread or named arguments to a host function: the compiler does not
+    /// know its parameter names, so imports take exactly their positional
+    /// parameters.
     ExternArgs,
     /// A conversion at a width dynamic values do not have (`zext`/`sext` to
     /// fewer than 64 bits, 32-bit bit casts).
@@ -81,9 +84,6 @@ impl Unsupported {
     #[must_use]
     pub const fn describe(self) -> &'static str {
         match self {
-            Self::Coroutine => {
-                "coroutines (yield, await, spawn, async and generator functions) arrive in bcgen-lang 0.5"
-            }
             Self::Class => {
                 "classes, impls, mixins, and receiver parameters arrive in bcgen-lang 0.5"
             }
@@ -91,13 +91,13 @@ impl Unsupported {
                 "declared record, struct, and sum types arrive with classes in bcgen-lang 0.5"
             }
             Self::Reference => {
-                "dereference, borrow, and by-reference patterns (the dynamic profile has no reference values)"
+                "dereference, borrow, and by-reference patterns (the dynamic profile has no pointer values)"
             }
             Self::RefPlace => {
-                "a reference to a place that is not a local variable (LSB has no reference to a map slot)"
+                "a reference to an appended element, a variable variable, or a value that is not a place"
             }
             Self::VarVar => "variable variables (LSB frames have no names at run time)",
-            Self::Intrinsic => "atomic, volatile, fence, or unknown named intrinsics",
+            Self::Intrinsic => "atomic, volatile, and fence intrinsics (native backends only)",
             Self::Asm => "inline assembly (native backends only)",
             Self::BigInt => "big-integer literals (no big-integer runtime yet)",
             Self::ForeignUnit => {
@@ -106,10 +106,10 @@ impl Unsupported {
             Self::TypeDirected => {
                 "type-directed paths and type-level values arrive with typed fast paths in bcgen-lang 0.5"
             }
-            Self::ExternValue => "a host function used as a value (LSB imports have a fixed arity)",
-            Self::ExternArgs => {
-                "spread, named, or by-reference arguments to a host function, or defaults on a bodyless function"
+            Self::ExternValue => {
+                "a host function used as a value (its parameter list is unknown to the compiler)"
             }
+            Self::ExternArgs => "spread or named arguments to a host function",
             Self::Conversion => "a conversion at a width dynamic values do not have",
             Self::Cast => "a cast to a type the dynamic profile cannot test or produce",
             Self::Pattern => "a pattern form the dynamic profile cannot test",
@@ -191,17 +191,41 @@ pub enum CompileError {
         /// Its source span.
         span: Span,
     },
-    /// A named intrinsic called with the wrong number of operands.
+    /// A named intrinsic the [`Intrinsics`](crate::Intrinsics) table does
+    /// not have.
+    UnknownIntrinsic {
+        /// The intrinsic's name.
+        name: Symbol,
+        /// The intrinsic's node.
+        node: NodeRef,
+        /// Its source span.
+        span: Span,
+    },
+    /// A named intrinsic called with a number of operands its table entry
+    /// does not accept.
     IntrinsicArity {
         /// The intrinsic's node.
         node: NodeRef,
         /// Its source span.
         span: Span,
         /// The operands it takes.
-        expected: u32,
+        arity: Arity,
+        /// The operands it was given.
+        found: u32,
     },
-    /// A function or closure with more parameters than the calling convention
-    /// carries (64, the width of the presence mask).
+    /// A call with more arguments than an LSB call window carries (255,
+    /// counting a method's receiver).
+    TooManyArgs {
+        /// The call.
+        node: NodeRef,
+        /// Its source span.
+        span: Span,
+        /// The limit.
+        limit: u32,
+    },
+    /// A function or closure with more parameters than an LSB parameter list
+    /// carries: 64 when a parameter has a default (the width of the presence
+    /// mask), else 255 (including a generator closure's captures).
     TooManyParams {
         /// The function or closure.
         node: NodeRef,
@@ -248,7 +272,9 @@ impl CompileError {
             | Self::ErrorNode { node, .. }
             | Self::LiteralOutOfRange { node, .. }
             | Self::NotAssignable { node, .. }
+            | Self::UnknownIntrinsic { node, .. }
             | Self::IntrinsicArity { node, .. }
+            | Self::TooManyArgs { node, .. }
             | Self::TooManyParams { node, .. }
             | Self::TooManyJumps { node, .. } => Some(node),
             Self::BudgetExceeded { .. } | Self::Build(_) => None,
@@ -272,7 +298,9 @@ impl CompileError {
             | Self::ErrorNode { span, .. }
             | Self::LiteralOutOfRange { span, .. }
             | Self::NotAssignable { span, .. }
+            | Self::UnknownIntrinsic { span, .. }
             | Self::IntrinsicArity { span, .. }
+            | Self::TooManyArgs { span, .. }
             | Self::TooManyParams { span, .. }
             | Self::TooManyJumps { span, .. } => Some(span),
             Self::BudgetExceeded { .. } | Self::Build(_) => None,
@@ -294,8 +322,19 @@ impl fmt::Display for CompileError {
             Self::NotAssignable { span, .. } => {
                 write!(f, "assignment target at {span:?} is not a writable place")
             }
-            Self::IntrinsicArity { span, expected, .. } => {
-                write!(f, "intrinsic at {span:?} takes {expected} operands")
+            Self::UnknownIntrinsic { span, .. } => {
+                write!(f, "intrinsic at {span:?} is not in the intrinsic table")
+            }
+            Self::IntrinsicArity {
+                span, arity, found, ..
+            } => {
+                write!(
+                    f,
+                    "intrinsic at {span:?} takes {arity} operands, not {found}"
+                )
+            }
+            Self::TooManyArgs { span, limit, .. } => {
+                write!(f, "call at {span:?} has more than {limit} arguments")
             }
             Self::TooManyParams { span, limit, .. } => {
                 write!(f, "function at {span:?} has more than {limit} parameters")

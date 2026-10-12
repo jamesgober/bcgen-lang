@@ -5,22 +5,25 @@ use alloc::vec::Vec;
 
 use bytecode_lang::{Inst, Reg, ValType};
 use hir_lang::{
-    Block, CaptureMode, Closure, DefaultEval, Effects, Expr, ExprId, Intrinsic, ItemKind, Lit,
-    Member, NodeRef, Res,
+    Block, CaptureMode, Closure, DefaultEval, Expr, ExprId, Intrinsic, ItemKind, Lit, Member,
+    NodeRef, Res,
 };
 use intern_lang::Lookup;
 
+use super::coro::CoroStep;
 use super::{Dst, Gen, Rel, Step, Task, Val};
 use crate::error::{CompileError, Unsupported};
-use crate::unit::{Cap, Job, MAX_PARAMS, Slot};
+use crate::unit::{Cap, Job, PInfo, Slot, check_params, is_generator};
 
 impl<L: Lookup> Gen<'_, '_, L> {
     /// The expression produces a value no variable or container also holds,
-    /// so storing it needs no copy. A cast can be the identity, and a bound
-    /// hook may return one of its operands, so with hooks only literals,
-    /// closures, and collection literals count.
+    /// so storing it needs no copy. A cast can be the identity, a bound hook
+    /// or a host function may return one of its operands, and an intrinsic
+    /// may be either, so with hooks only literals, closures, and collection
+    /// literals count, and host calls and intrinsics never do.
     pub(crate) fn fresh(&self, e: ExprId) -> bool {
-        match self.cx.hir.expr(e) {
+        let hir = self.cx.hir;
+        match *hir.expr(e) {
             Expr::Lit(_)
             | Expr::Closure(_)
             | Expr::Tuple(_)
@@ -28,11 +31,28 @@ impl<L: Lookup> Gen<'_, '_, L> {
             | Expr::Repeat { .. }
             | Expr::Record { .. }
             | Expr::Map(_) => true,
-            Expr::Op { .. }
-            | Expr::Call { .. }
-            | Expr::MethodCall { .. }
-            | Expr::DynMethodCall { .. }
-            | Expr::Intrinsic { .. } => self.cx.opts.hooks().is_empty(),
+            Expr::Call { callee, .. } => {
+                let host = match *hir.expr(callee) {
+                    Expr::Path(p) => match hir.path(p).res {
+                        Res::Extern(_) => true,
+                        res @ Res::Def(_) => self
+                            .cx
+                            .local_item(res, NodeRef::Path(p))
+                            .ok()
+                            .flatten()
+                            .is_some_and(|i| match hir.item(i).kind {
+                                ItemKind::Fn(def) => def.body.is_none(),
+                                _ => false,
+                            }),
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                !host && self.cx.opts.hooks().is_empty()
+            }
+            Expr::Op { .. } | Expr::MethodCall { .. } | Expr::DynMethodCall { .. } => {
+                self.cx.opts.hooks().is_empty()
+            }
             _ => false,
         }
     }
@@ -309,6 +329,11 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 self.sched([Task::Expr(expr, Dst::Any), Task::Finish(e, dst)]);
             }
             Expr::Assign { target, op, value } => self.assign(e, target, op, value, dst)?,
+            Expr::LetPlace {
+                binder,
+                place,
+                body,
+            } => self.let_place(binder, place, body, dst)?,
             Expr::RefAssign { target, source } => self.ref_assign(e, target, source, dst)?,
             Expr::Deref(_) | Expr::Borrow { .. } => {
                 return Err(self.cx.unsupported(Unsupported::Reference, node));
@@ -335,30 +360,16 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 catches,
                 finally,
             } => self.try_expr(e, body, catches, finally, dst),
-            Expr::Await(_) | Expr::Yield(_) | Expr::Spawn(_) => {
-                return Err(self.cx.unsupported(Unsupported::Coroutine, node));
-            }
+            Expr::Yield { key, value } => self.yield_expr(e, key, value, dst),
+            Expr::YieldFrom(x) => self.coro_unary(x, CoroStep::YieldFrom { dst, node }),
+            Expr::Await(x) => self.coro_unary(x, CoroStep::Await { dst, node }),
+            Expr::Spawn(x) => self.coro_unary(x, CoroStep::Spawn { dst, node }),
             Expr::Asm(_) => return Err(self.cx.unsupported(Unsupported::Asm, node)),
             Expr::Intrinsic { kind, args, .. } => {
                 let Intrinsic::Named(name) = kind else {
                     return Err(self.cx.unsupported(Unsupported::Intrinsic, node));
                 };
-                let list = hir.list(args);
-                let arity = self.intrinsic_arity(name, node)?;
-                if list.len() != arity {
-                    return Err(CompileError::IntrinsicArity {
-                        node,
-                        span: self.cx.span(node),
-                        expected: u32::try_from(arity).unwrap_or(u32::MAX),
-                    });
-                }
-                self.tasks.push(Task::Finish(e, dst));
-                for i in (0..list.len()).rev() {
-                    let d = self.operand_dst(list, i);
-                    if let Some(&x) = list.get(i) {
-                        self.tasks.push(Task::Expr(x, d));
-                    }
-                }
+                self.intrinsic_expr(e, name, hir.list(args), dst)?;
             }
             Expr::Err => {
                 return Err(CompileError::ErrorNode {
@@ -461,10 +472,10 @@ impl<L: Lookup> Gen<'_, '_, L> {
                         self.produced(r, dst);
                     }
                 }
-                Some(s @ (Slot::Global(_) | Slot::GlobalCell(_))) => {
+                Some(s @ (Slot::Global(_) | Slot::GlobalCell(_) | Slot::Place(_))) => {
                     if dst != Dst::Discard {
                         let r = self.result_reg(dst);
-                        self.read_slot(s, r);
+                        self.read_slot_at(s, r, node)?;
                         self.produced(r, dst);
                     }
                 }
@@ -488,7 +499,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 };
                 match self.cx.hir.item(item).kind {
                     ItemKind::Fn(_) => {
-                        let Some(f) = self.cx.dyn_entry(item) else {
+                        let Some(f) = self.cx.fns.get(&item).and_then(|i| i.callable) else {
                             return Err(self.cx.unsupported(Unsupported::ExternValue, node));
                         };
                         if dst != Dst::Discard {
@@ -503,7 +514,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                         };
                         if dst != Dst::Discard {
                             let r = self.result_reg(dst);
-                            self.read_slot(slot, r);
+                            self.read_var(slot, r);
                             self.produced(r, dst);
                         }
                     }
@@ -597,20 +608,6 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 self.release(v);
                 self.dummy(dst);
             }
-            Expr::Intrinsic {
-                kind: Intrinsic::Named(name),
-                args,
-                ..
-            } => {
-                let n = hir.list(args).len();
-                let vals = self.pop_n(n);
-                let r = self.result_reg(dst);
-                self.intrinsic(name, &vals, r, node)?;
-                for v in vals {
-                    self.release(v);
-                }
-                self.produced(r, dst);
-            }
             _ => {}
         }
         Ok(())
@@ -633,123 +630,6 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 rel: Rel::Temp,
             });
         }
-    }
-
-    // ------------------------------------------------------------ intrinsics
-
-    fn intrinsic_arity(
-        &self,
-        name: hir_lang::Symbol,
-        node: NodeRef,
-    ) -> Result<usize, CompileError> {
-        let n = self.cx.names.resolve_with(name, |s| match s {
-            "concat" => 2,
-            "len" | "truthy" | "lnot" | "type_of" | "iter" | "iter_next" => 1,
-            _ => 0,
-        });
-        match n {
-            Some(n) if n > 0 => Ok(n),
-            _ => Err(self.cx.unsupported(Unsupported::Intrinsic, node)),
-        }
-    }
-
-    /// The named intrinsics: the dynamic instructions without an OPS
-    /// operation (`concat`, `len`, `truthy`, `lnot`, `type_of`) and
-    /// iteration (`iter`, `iter_next`).
-    fn intrinsic(
-        &mut self,
-        name: hir_lang::Symbol,
-        args: &[Val],
-        r: Reg,
-        node: NodeRef,
-    ) -> Result<(), CompileError> {
-        let text = self.cx.text(name);
-        let a = args.first().map_or(Reg(0), |v| v.reg);
-        let b = args.get(1).map_or(Reg(0), |v| v.reg);
-        match text.as_str() {
-            "concat" => self.emit(Inst::DConcat {
-                dst: r,
-                lhs: a,
-                rhs: b,
-            }),
-            "len" => {
-                let n = self.fx.temp(ValType::I64);
-                self.emit(Inst::DLen { dst: n, src: a });
-                self.emit(Inst::ToDyn {
-                    dst: r,
-                    src: n,
-                    from: bytecode_lang::Prim::I64,
-                });
-                self.fx.release(n);
-            }
-            "truthy" | "lnot" => {
-                let t = self.fx.temp(ValType::Bool);
-                if text == "truthy" {
-                    self.emit(Inst::DTruthy { dst: t, src: a });
-                } else {
-                    self.emit(Inst::DLNot { dst: t, src: a });
-                }
-                self.emit(Inst::ToDyn {
-                    dst: r,
-                    src: t,
-                    from: bytecode_lang::Prim::Bool,
-                });
-                self.fx.release(t);
-            }
-            "type_of" => {
-                let t = self.fx.temp(ValType::U8);
-                self.emit(Inst::TypeOf { dst: t, src: a });
-                self.emit(Inst::ToDyn {
-                    dst: r,
-                    src: t,
-                    from: bytecode_lang::Prim::U8,
-                });
-                self.fx.release(t);
-            }
-            "iter" => {
-                // PHP iterates a snapshot: a copy-on-write `dup` first.
-                if self.php() {
-                    let t = self.fx.temp(ValType::Dyn);
-                    self.dup_into(t, a);
-                    self.emit(Inst::DIterNew { dst: r, src: t });
-                    self.fx.release(t);
-                } else {
-                    self.emit(Inst::DIterNew { dst: r, src: a });
-                }
-            }
-            "iter_next" => {
-                // nil when done, else the pair [key, value].
-                let has = self.fx.temp(ValType::Bool);
-                let v = self.fx.temp(ValType::Dyn);
-                let k = self.fx.temp(ValType::Dyn);
-                let done = self.label();
-                let end = self.label();
-                self.emit(Inst::IterNext {
-                    has,
-                    iter: a,
-                    val: v,
-                });
-                self.jump_on(has, done, false);
-                self.emit(Inst::IterKey { dst: k, iter: a });
-                let m = self.new_map();
-                self.emit(Inst::MapPush { map: m, src: k });
-                if self.php() {
-                    self.dup_into(v, v);
-                }
-                self.emit(Inst::MapPush { map: m, src: v });
-                self.emit(Inst::Mov { dst: r, src: m });
-                self.fx.release(m);
-                self.jmp(end);
-                self.bind(done);
-                self.emit(Inst::LoadNil { dst: r });
-                self.bind(end);
-                self.fx.release(k);
-                self.fx.release(v);
-                self.fx.release(has);
-            }
-            _ => return Err(self.cx.unsupported(Unsupported::Intrinsic, node)),
-        }
-        Ok(())
     }
 
     // ------------------------------------------------------------ repeat, record
@@ -868,17 +748,8 @@ impl<L: Lookup> Gen<'_, '_, L> {
     fn closure(&mut self, e: ExprId, c: Closure, dst: Dst) -> Result<(), CompileError> {
         let node = NodeRef::Expr(e);
         let hir = self.cx.hir;
-        if c.effects.contains(Effects::ASYNC) || c.effects.contains(Effects::YIELD) {
-            return Err(self.cx.unsupported(Unsupported::Coroutine, node));
-        }
+        let generator = is_generator(c.effects);
         let params = hir.list(c.params);
-        if params.len() > MAX_PARAMS {
-            return Err(CompileError::TooManyParams {
-                node,
-                span: self.cx.span(node),
-                limit: MAX_PARAMS as u32,
-            });
-        }
         if params
             .iter()
             .any(|&p| hir.param(p).kind == hir_lang::ParamKind::Receiver)
@@ -897,6 +768,10 @@ impl<L: Lookup> Gen<'_, '_, L> {
             let pnode = NodeRef::Path(cap.outer);
             let outer = hir.path(cap.outer);
             let src = match outer.res {
+                // A place alias never crosses a frame (HIR §3.2).
+                Res::Local(ob) if matches!(self.cx.slot(ob), Some(Slot::Place(_))) => {
+                    return Err(self.cx.unsupported(Unsupported::RefPlace, pnode));
+                }
                 Res::Local(ob) => self.cx.slot(ob),
                 Res::Def(_) => {
                     let item = self.cx.local_item(outer.res, pnode)?;
@@ -922,6 +797,9 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 });
             };
             match (cap.mode, src) {
+                (_, Slot::Place(_)) => {
+                    return Err(self.cx.unsupported(Unsupported::RefPlace, pnode));
+                }
                 (CaptureMode::ByValue | CaptureMode::Infer, _) => {
                     caps.push(Cap::Value(cap.binder));
                     sources.push(Some(src));
@@ -946,6 +824,9 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 continue;
             };
             match (c.implicit, src) {
+                (_, Slot::Place(_)) => {
+                    return Err(self.cx.unsupported(Unsupported::RefPlace, node));
+                }
                 // By value: a copy at creation, whatever holds the variable.
                 (Some(CaptureMode::ByValue), _) => {
                     caps.push(Cap::Value(b));
@@ -972,30 +853,64 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 }
             }
         }
-        // Declare the closure's function with its capture layout.
-        self.cx.closures += 1;
-        let mut name = alloc::string::String::from("<closure#");
-        name.push_str(&alloc::format!("{}>", self.cx.closures));
-        let mut f = self
-            .cx
-            .mb
-            .function(&name, &[ValType::Dyn, ValType::Dyn], &[ValType::Dyn]);
-        let mut shape: Vec<ValType> = alloc::vec![ValType::Dyn];
-        for cap in &caps {
-            let ty = match cap {
+        // The closure's function: its parameter list and capture layout. A
+        // generator closure is an entry with the captures that makes a
+        // coroutine of a body taking them as leading parameters.
+        let plist: Vec<PInfo> = params.iter().map(|&p| PInfo::of(hir, p)).collect();
+        let extra = if generator { caps.len() } else { 0 };
+        check_params(&plist, extra, node, self.cx.span(node))?;
+        let mut sig: Vec<ValType> = plist.iter().map(|p| p.reg_type(&self.cx.types)).collect();
+        if plist.iter().any(|p| p.default.is_some()) {
+            sig.push(ValType::I64);
+        }
+        let cap_types: Vec<ValType> = caps
+            .iter()
+            .map(|cap| match cap {
                 Cap::Value(_) | Cap::Once(_) => ValType::Dyn,
                 Cap::Cell(_) | Cap::SelfCell(_) => self.cell_ty(),
-            };
+            })
+            .collect();
+        self.cx.closures += 1;
+        let name = alloc::format!("<closure#{}>", self.cx.closures);
+        let list = self.cx.param_list(&plist);
+        let mut f = self.cx.mb.function(&name, &sig, &[ValType::Dyn]);
+        f.set_params(list);
+        for &ty in &cap_types {
             let _ = f.capture(ty);
-            shape.push(ty);
         }
+        let mut shape: Vec<ValType> = alloc::vec![ValType::Dyn];
+        shape.extend_from_slice(&cap_types);
         let func = f.id();
-        self.queue(Job::Closure {
-            e,
-            f,
-            caps: caps.clone(),
-            aliases,
-        });
+        if generator {
+            let mut body_sig = cap_types.clone();
+            body_sig.extend_from_slice(&sig);
+            let mut gname = name;
+            gname.push_str("$gen");
+            let body = self.cx.mb.function(&gname, &body_sig, &[ValType::Dyn]);
+            let body_id = body.id();
+            self.queue(Job::Closure {
+                e,
+                f: body,
+                caps: caps.clone(),
+                aliases,
+                caps_in_params: true,
+            });
+            self.queue(Job::GenEntry {
+                f,
+                body: body_id,
+                caps: cap_types,
+                sig,
+                node,
+            });
+        } else {
+            self.queue(Job::Closure {
+                e,
+                f,
+                caps: caps.clone(),
+                aliases,
+                caps_in_params: false,
+            });
+        }
         // Fill the capture window.
         let win = self.fx.window(&shape);
         let mut self_cell = None;
@@ -1007,12 +922,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 (Cap::SelfCell(_), _) => {
                     let n = self.fx.temp(ValType::Dyn);
                     self.emit(Inst::LoadNil { dst: n });
-                    let ty = self.cell_ref();
-                    self.emit(Inst::NewCell {
-                        dst: slot,
-                        src: n,
-                        ty,
-                    });
+                    self.emit(Inst::NewRef { dst: slot, src: n });
                     self.fx.release(n);
                     self_cell = Some(slot);
                 }
@@ -1033,7 +943,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     }
                 }
                 (Cap::Value(_), Some(s @ (Slot::Global(_) | Slot::GlobalCell(_)))) => {
-                    self.read_slot(*s, slot);
+                    self.read_var(*s, slot);
                     if php {
                         self.dup_into(slot, slot);
                     }

@@ -9,9 +9,11 @@
 //! values their children pushed.
 
 mod call;
+mod coro;
 mod entry;
 mod expr;
 mod flow;
+mod intrinsic;
 mod ops;
 mod pat;
 mod place;
@@ -110,7 +112,7 @@ pub(crate) enum Task {
         dup: bool,
         node: NodeRef,
     },
-    /// Pops a value and stores a new cell holding it into `cell`.
+    /// Pops a value and stores a new reference holding it into `cell`.
     NewCell {
         cell: Reg,
         dup: bool,
@@ -188,6 +190,11 @@ pub(crate) enum Step {
     Call(call::CallStep),
     /// Assignment to a place chain (see `place.rs`).
     Place(place::PlaceStep),
+    /// Coroutines: `yield`, `yield from`, `await`, `spawn` (see `coro.rs`).
+    Coro(coro::CoroStep),
+    /// A named intrinsic whose operands are in a host-call window (see
+    /// `intrinsic.rs`).
+    Intrinsic(intrinsic::IntrinsicStep),
     /// Closure creation (see `expr.rs`).
     MakeClosure {
         e: ExprId,
@@ -202,7 +209,7 @@ pub(crate) enum Step {
         flag: bytecode_lang::GlobalId,
         done: Label,
     },
-    /// The second half of a shared `static $x = init`: a new cell.
+    /// The second half of a shared `static $x = init`: a new reference.
     StaticCell {
         global: bytecode_lang::GlobalId,
         flag: bytecode_lang::GlobalId,
@@ -210,7 +217,7 @@ pub(crate) enum Step {
     },
     /// Stores the popped value into a global.
     SetGlobal(bytecode_lang::GlobalId),
-    /// Stores a new cell holding the popped value into a global.
+    /// Stores a new reference holding the popped value into a global.
     SetGlobalCell(bytecode_lang::GlobalId),
     /// Returns the popped value from the function.
     Ret,
@@ -236,6 +243,8 @@ pub(crate) enum Step {
     },
     /// Raises `TypeError` at the current node.
     RaiseTypeError,
+    /// Raises `NoMatch` (E0200) with the popped scrutinee as its payload.
+    RaiseNoMatch,
 }
 
 /// The generator of one function.
@@ -245,6 +254,9 @@ pub(crate) struct Gen<'c, 'a, L: Lookup> {
     pub(crate) tasks: Vec<Task>,
     pub(crate) vals: Vec<Val>,
     pub(crate) params: Option<entry::Params>,
+    /// Evaluated places: `let_place` aliases and the places assignments,
+    /// reference assignments, and place arguments are using.
+    pub(crate) places: Vec<place::EvPlace>,
 }
 
 impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
@@ -255,6 +267,7 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
             tasks: Vec::new(),
             vals: Vec::new(),
             params: None,
+            places: Vec::new(),
         }
     }
 
@@ -335,11 +348,9 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
             Task::NewCell { cell, dup } => {
                 let v = self.pop();
                 let v = self.transfer(v, dup);
-                let ty = self.cell_ref();
-                self.emit(Inst::NewCell {
+                self.emit(Inst::NewRef {
                     dst: cell,
                     src: v.reg,
-                    ty,
                 });
                 self.release(v);
             }
@@ -397,6 +408,8 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
         match s {
             Step::Call(c) => self.call_step(c),
             Step::Place(p) => self.place_step(p),
+            Step::Coro(c) => self.coro_step(c),
+            Step::Intrinsic(i) => self.intrinsic_step(i),
             Step::MakeClosure {
                 e,
                 win,
@@ -427,12 +440,7 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
                 let v = self.transfer(v, self.php());
                 let ct = self.cell_ty();
                 let c = self.fx.temp(ct);
-                let ty = self.cell_ref();
-                self.emit(Inst::NewCell {
-                    dst: c,
-                    src: v.reg,
-                    ty,
-                });
+                self.emit(Inst::NewRef { dst: c, src: v.reg });
                 self.emit(Inst::SetGlobal { global, src: c });
                 self.fx.release(c);
                 self.release(v);
@@ -450,12 +458,7 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
                 let v = self.pop();
                 let ct = self.cell_ty();
                 let c = self.fx.temp(ct);
-                let ty = self.cell_ref();
-                self.emit(Inst::NewCell {
-                    dst: c,
-                    src: v.reg,
-                    ty,
-                });
+                self.emit(Inst::NewRef { dst: c, src: v.reg });
                 self.emit(Inst::SetGlobal { global: g, src: c });
                 self.fx.release(c);
                 self.release(v);
@@ -500,6 +503,15 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
             }
             Step::RaiseTypeError => {
                 self.raise_type_error();
+                Ok(())
+            }
+            Step::RaiseNoMatch => {
+                let v = self.pop();
+                self.emit(Inst::Raise {
+                    src: v.reg,
+                    kind: bytecode_lang::ErrorKind::NoMatch,
+                });
+                self.release(v);
                 Ok(())
             }
         }
@@ -569,11 +581,6 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
 
     pub(crate) fn map_ref(&mut self) -> bytecode_lang::TypeRef {
         let t = self.cx.types.map;
-        self.fx.f.type_ref(t)
-    }
-
-    pub(crate) fn cell_ref(&mut self) -> bytecode_lang::TypeRef {
-        let t = self.cx.types.cell;
         self.fx.f.type_ref(t)
     }
 
@@ -700,18 +707,16 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
         self.fx.release(b);
     }
 
-    /// Raises `TypeError` (E0100) at the current node: unboxing `nil` as a
-    /// `bool` is a type error with no hook to intercept it.
+    /// Raises `TypeError` (E0100) with a nil payload at the current node.
     pub(crate) fn raise_type_error(&mut self) {
+        self.raise_kind(bytecode_lang::ErrorKind::TypeError);
+    }
+
+    /// Raises a runtime error of `kind` with a nil payload (`raise`).
+    pub(crate) fn raise_kind(&mut self, kind: bytecode_lang::ErrorKind) {
         let n = self.fx.temp(ValType::Dyn);
-        let b = self.fx.temp(ValType::Bool);
         self.emit(Inst::LoadNil { dst: n });
-        self.emit(Inst::FromDyn {
-            dst: b,
-            src: n,
-            to: bytecode_lang::Prim::Bool,
-        });
-        self.fx.release(b);
+        self.emit(Inst::Raise { src: n, kind });
         self.fx.release(n);
     }
 
@@ -760,7 +765,8 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
 
     // ------------------------------------------------------------ binders
 
-    /// Allocates the variable `b` in the innermost open scope.
+    /// Allocates the variable `b` in the innermost open scope (a shared
+    /// variable's register holds its reference).
     pub(crate) fn alloc_binder(&mut self, b: BinderId) -> Slot {
         let cell = self.cx.is_cell(b);
         let ty = if cell { self.cell_ty() } else { ValType::Dyn };
@@ -782,7 +788,8 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
     }
 
     /// Binds `b` to the value in `v`: the variable's first binding allocates
-    /// it; a cell variable gets a new cell (a new variable per binding).
+    /// it; a shared variable gets a new reference (a new variable per
+    /// binding).
     pub(crate) fn bind_binder(&mut self, b: BinderId, v: Reg) {
         let slot = match self.cx.slot(b) {
             Some(s) => s,
@@ -804,8 +811,7 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
                 } else {
                     self.emit(Inst::Mov { dst: t, src: v });
                 }
-                let ty = self.cell_ref();
-                self.emit(Inst::NewCell { dst: c, src: t, ty });
+                self.emit(Inst::NewRef { dst: c, src: t });
                 self.fx.release(t);
             }
             Slot::Global(_) | Slot::GlobalCell(_) => {
@@ -815,14 +821,17 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
                 } else {
                     self.emit(Inst::Mov { dst: t, src: v });
                 }
-                self.write_slot(slot, t);
+                self.write_var(slot, t);
                 self.fx.release(t);
             }
+            // Patterns never bind a place alias.
+            Slot::Place(_) => {}
         }
     }
 
-    /// Reads a variable's value into `dst`.
-    pub(crate) fn read_slot(&mut self, slot: Slot, dst: Reg) {
+    /// Reads a variable's value into `dst` (an alias: see
+    /// [`read_slot_at`](Self::read_slot_at)).
+    pub(crate) fn read_var(&mut self, slot: Slot, dst: Reg) {
         match slot {
             Slot::Reg(r) => {
                 if r != dst {
@@ -838,11 +847,13 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
                 self.emit(Inst::CellGet { dst, cell: c });
                 self.fx.release(c);
             }
+            Slot::Place(_) => {}
         }
     }
 
-    /// Writes a variable.
-    pub(crate) fn write_slot(&mut self, slot: Slot, src: Reg) {
+    /// Writes a variable (an alias: see
+    /// [`write_slot_at`](Self::write_slot_at)).
+    pub(crate) fn write_var(&mut self, slot: Slot, src: Reg) {
         match slot {
             Slot::Reg(r) => {
                 if r != src {
@@ -858,21 +869,7 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
                 self.emit(Inst::CellSet { cell: c, src });
                 self.fx.release(c);
             }
-        }
-    }
-
-    /// The cell of a shared variable, in a register: its own register, or a
-    /// new temporary loaded from the global that holds it (`owned`).
-    pub(crate) fn cell_of(&mut self, slot: Slot) -> Option<(Reg, bool)> {
-        match slot {
-            Slot::Cell(c) => Some((c, false)),
-            Slot::GlobalCell(g) => {
-                let ct = self.cell_ty();
-                let c = self.fx.temp(ct);
-                self.emit(Inst::GetGlobal { dst: c, global: g });
-                Some((c, true))
-            }
-            Slot::Reg(_) | Slot::Global(_) => None,
+            Slot::Place(_) => {}
         }
     }
 

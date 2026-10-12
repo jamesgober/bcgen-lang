@@ -8,7 +8,7 @@
 //! destination last, so a raising operation leaves it untouched (LSB §4.3).
 
 use bytecode_lang::{
-    FloatTy, Inst, IntConv, IntOp, IntPair, IntTy, Kind, Prim as BPrim, Reg, ValType,
+    FloatConv, FloatTy, Inst, IntConv, IntOp, IntPair, IntTy, Kind, Prim as BPrim, Reg, ValType,
 };
 use hir_lang::{NodeRef, Op, OpKind, Overflow, Policy, Prim, Ty, TyId};
 use intern_lang::Lookup;
@@ -32,6 +32,7 @@ pub(crate) fn policy(p: Policy) -> bytecode_lang::Policy {
         q = q.with_shift(match s {
             hir_lang::Shift::Error => bytecode_lang::Shift::Error,
             hir_lang::Shift::Mask => bytecode_lang::Shift::Mask,
+            hir_lang::Shift::Saturate => bytecode_lang::Shift::Saturate,
         });
     }
     if let Some(f) = p.float_to_int {
@@ -50,6 +51,15 @@ fn overflow(o: Overflow) -> bytecode_lang::Overflow {
         Overflow::Trap => bytecode_lang::Overflow::Trap,
         Overflow::Promote => bytecode_lang::Overflow::Promote,
     }
+}
+
+/// The float-to-integer conversion to `ty` under a HIR policy's
+/// `float_to_int` (absent: `error`).
+fn float_conv(ty: IntTy, p: Policy) -> FloatConv {
+    FloatConv::new(ty).with_float_to_int(match p.float_to_int {
+        Some(hir_lang::FloatToInt::Saturate) => bytecode_lang::FloatToInt::Saturate,
+        _ => bytecode_lang::FloatToInt::Error,
+    })
 }
 
 /// The LSB integer type of a HIR primitive (`isize`/`usize` are 64-bit).
@@ -148,37 +158,25 @@ pub(crate) fn emit_op<L: Lookup>(
             pol,
         }),
         OpKind::Neg => g.emit(Inst::DNeg { dst, src: a, pol }),
+        OpKind::Pow => g.emit(Inst::DPow {
+            dst,
+            lhs: a,
+            rhs: b,
+            pol,
+        }),
         OpKind::And | OpKind::Or | OpKind::Xor => logic2(g, op.kind, a, b, dst, pol),
         OpKind::Not => {
-            // Logical on a bool, the bitwise complement otherwise (OPS §3).
-            let isb = g.fx.temp(ValType::Bool);
+            // Logical negation of truthiness (HIR v3 `not`, LSB `dnot`).
             let x = g.fx.temp(ValType::Bool);
-            let int = g.label();
-            let end = g.label();
-            g.emit(Inst::IsKind {
-                dst: isb,
-                src: a,
-                kind: Kind::Bool,
-            });
-            g.jump_on(isb, int, false);
-            g.emit(Inst::FromDyn {
-                dst: x,
-                src: a,
-                to: BPrim::Bool,
-            });
-            g.emit(Inst::BNot { dst: x, src: x });
+            g.emit(Inst::DNot { dst: x, src: a });
             g.emit(Inst::ToDyn {
                 dst,
                 src: x,
                 from: BPrim::Bool,
             });
-            g.jmp(end);
-            g.bind(int);
-            g.emit(Inst::DNot { dst, src: a, pol });
-            g.bind(end);
             g.fx.release(x);
-            g.fx.release(isb);
         }
+        OpKind::BitNot => g.emit(Inst::DBitNot { dst, src: a, pol }),
         OpKind::Eq | OpKind::Ne | OpKind::Lt | OpKind::Le | OpKind::Gt | OpKind::Ge => {
             let t = g.fx.temp(ValType::Bool);
             emit_cmp(g, op.kind, t, a, b);
@@ -267,7 +265,7 @@ pub(crate) fn emit_op<L: Lookup>(
                 ty: FloatTy::F64,
             });
         }
-        OpKind::Abs => abs(g, a, dst, op.policy.overflow.unwrap_or(Overflow::Error)),
+        OpKind::Abs => g.emit(Inst::DAbs { dst, src: a, pol }),
         OpKind::IntCast(t) => {
             let ty = int_ty(t).unwrap_or(IntTy::I64);
             let over = overflow(op.policy.overflow.unwrap_or(Overflow::Error));
@@ -293,7 +291,7 @@ pub(crate) fn emit_op<L: Lookup>(
             g.emit(Inst::F64ToInt {
                 dst: y,
                 src: x,
-                op: IntOp::new(ty).with_policy(pol),
+                conv: float_conv(ty, op.policy),
             });
             g.emit(Inst::ToDyn {
                 dst,
@@ -723,88 +721,6 @@ fn logic2<L: Lookup>(
     g.fx.release(ia);
 }
 
-/// `abs`: integers under the overflow policy (`promote` turns `abs(MIN)`
-/// into the `f64` 2^63), floats by clearing the sign.
-fn abs<L: Lookup>(g: &mut Gen<'_, '_, L>, a: Reg, dst: Reg, over: Overflow) {
-    let isi = g.fx.temp(ValType::Bool);
-    let float = g.label();
-    let done = g.label();
-    g.emit(Inst::IsKind {
-        dst: isi,
-        src: a,
-        kind: Kind::Int,
-    });
-    g.jump_on(isi, float, false);
-    let x = g.fx.temp(ValType::I64);
-    g.emit(Inst::FromDyn {
-        dst: x,
-        src: a,
-        to: BPrim::I64,
-    });
-    if over == Overflow::Promote {
-        let min = g.fx.temp(ValType::I64);
-        let big = g.label();
-        g.load_i64(min, i64::MIN);
-        g.emit(Inst::IEq {
-            dst: isi,
-            lhs: x,
-            rhs: min,
-            ty: IntTy::I64,
-        });
-        g.fx.release(min);
-        let normal = g.label();
-        g.jump_on(isi, normal, false);
-        g.jmp(big);
-        g.bind(normal);
-        let op = IntOp::new(IntTy::I64)
-            .with_policy(bytecode_lang::Policy::new().with_overflow(bytecode_lang::Overflow::Wrap));
-        g.emit(Inst::IAbs { dst: x, src: x, op });
-        g.emit(Inst::ToDyn {
-            dst,
-            src: x,
-            from: BPrim::I64,
-        });
-        g.jmp(done);
-        g.bind(big);
-        let k =
-            g.cx.mb
-                .constant(bytecode_lang::Const::f64(9_223_372_036_854_775_808.0));
-        g.emit(Inst::DLoadConst { dst, k });
-        g.jmp(done);
-    } else {
-        let op = IntOp::new(IntTy::I64)
-            .with_policy(bytecode_lang::Policy::new().with_overflow(overflow(over)));
-        g.emit(Inst::IAbs { dst: x, src: x, op });
-        g.emit(Inst::ToDyn {
-            dst,
-            src: x,
-            from: BPrim::I64,
-        });
-        g.jmp(done);
-    }
-    g.fx.release(x);
-    g.bind(float);
-    let f = g.fx.temp(ValType::F64);
-    g.emit(Inst::FromDyn {
-        dst: f,
-        src: a,
-        to: BPrim::F64,
-    });
-    g.emit(Inst::FAbs {
-        dst: f,
-        src: f,
-        ty: FloatTy::F64,
-    });
-    g.emit(Inst::ToDyn {
-        dst,
-        src: f,
-        from: BPrim::F64,
-    });
-    g.fx.release(f);
-    g.bind(done);
-    g.fx.release(isi);
-}
-
 /// The primitive a cast's target type names, if it is one.
 fn cast_prim(hir: &hir_lang::Hir, ty: TyId) -> Option<Prim> {
     match *hir.ty(ty) {
@@ -850,6 +766,20 @@ pub(crate) fn emit_cast<L: Lookup>(
     }
     match *hir.ty(ty) {
         Ty::Any | Ty::Infer => {
+            if dst != src {
+                g.emit(Inst::Mov { dst, src });
+            }
+        }
+        Ty::Union(_) | Ty::Intersection(_) => {
+            // A union or intersection type converts nothing: a value whose
+            // kind it admits passes unchanged, any other is a TypeError.
+            let Some(kinds) = kind_set(hir, ty) else {
+                return Err(g.cx.unsupported(Unsupported::Cast, node));
+            };
+            let ok = g.label();
+            g.test_kinds(src, kinds, ok);
+            g.raise_type_error();
+            g.bind(ok);
             if dst != src {
                 g.emit(Inst::Mov { dst, src });
             }
@@ -972,10 +902,6 @@ fn cast_to_prim<L: Lookup>(
         _ => {
             let ty = int_ty(p).unwrap_or(IntTy::I64);
             let over = overflow(pol.overflow.unwrap_or(Overflow::Error));
-            let fpol = policy(Policy {
-                overflow: None,
-                ..pol
-            });
             let y = g.fx.temp(ValType::int(ty));
             let notint = g.label();
             let notfloat = g.label();
@@ -1005,7 +931,7 @@ fn cast_to_prim<L: Lookup>(
             g.emit(Inst::F64ToInt {
                 dst: y,
                 src: f,
-                op: IntOp::new(ty).with_policy(fpol),
+                conv: float_conv(ty, pol),
             });
             g.fx.release(f);
             g.jmp(boxit);
@@ -1024,4 +950,139 @@ fn cast_to_prim<L: Lookup>(
         }
     }
     g.fx.release(k);
+}
+
+/// A set of dynamic kinds, one bit per LSB kind code (§2.2).
+pub(crate) type KindSet = u16;
+
+/// Every kind.
+pub(crate) const ALL_KINDS: KindSet = u16::MAX;
+
+/// The kinds a type admits in the dynamic profile, for a type test or a
+/// checked cast: primitives by their kind, tuples and arrays as maps, `?T`
+/// adds `nil`, a union the kinds of any member, an intersection the kinds of
+/// every member, `never` none. `None` for a type the dynamic profile cannot
+/// test (a path to a declared type, a function type, ...). Iterative: an
+/// explicit stack, so nested unions of intersections of any depth cost no
+/// native stack.
+pub(crate) fn kind_set(hir: &hir_lang::Hir, ty: TyId) -> Option<KindSet> {
+    /// A union or intersection being combined: its members, the next one
+    /// to visit, and the set so far.
+    struct Frame {
+        union: bool,
+        members: hir_lang::List<TyId>,
+        next: usize,
+        acc: KindSet,
+        nullable: bool,
+    }
+    fn bit(k: Kind) -> KindSet {
+        1 << k.code()
+    }
+    fn prim_set(p: Prim) -> KindSet {
+        match p {
+            Prim::Bool => bit(Kind::Bool),
+            Prim::F32 | Prim::F64 => bit(Kind::Float),
+            Prim::Char => bit(Kind::Char),
+            Prim::Str => bit(Kind::Str),
+            _ => bit(Kind::Int),
+        }
+    }
+    let mut stack: alloc::vec::Vec<Frame> = alloc::vec::Vec::new();
+    let mut next = Some(ty);
+    loop {
+        // Resolve one type to a set, or open a frame for a compound.
+        let mut done: Option<KindSet> = None;
+        if let Some(t) = next.take() {
+            let mut t = t;
+            let mut nullable = false;
+            if let Ty::Nullable(inner) = *hir.ty(t) {
+                nullable = true;
+                t = inner;
+            }
+            let null = if nullable { bit(Kind::Nil) } else { 0 };
+            match *hir.ty(t) {
+                Ty::Any | Ty::Infer => done = Some(ALL_KINDS),
+                Ty::Never => done = Some(null),
+                Ty::Tuple(_) | Ty::Array { .. } | Ty::Slice(_) => {
+                    done = Some(bit(Kind::Map) | null);
+                }
+                Ty::Prim(p) => done = Some(prim_set(p) | null),
+                Ty::Path(p) => match hir.path(p).res {
+                    hir_lang::Res::Prim(p) => done = Some(prim_set(p) | null),
+                    _ => return None,
+                },
+                Ty::Union(list) | Ty::Intersection(list) => {
+                    let union = matches!(hir.ty(t), Ty::Union(_));
+                    stack.push(Frame {
+                        union,
+                        members: list,
+                        next: 0,
+                        acc: if union { 0 } else { ALL_KINDS },
+                        nullable,
+                    });
+                }
+                _ => return None,
+            }
+        }
+        if let Some(set) = done {
+            match stack.last_mut() {
+                None => return Some(set),
+                Some(f) => {
+                    if f.union {
+                        f.acc |= set;
+                    } else {
+                        f.acc &= set;
+                    }
+                }
+            }
+        }
+        // The next member of the innermost open compound, or close it.
+        loop {
+            let f = stack.last_mut()?;
+            if let Some(&m) = hir.list(f.members).get(f.next) {
+                f.next += 1;
+                next = Some(m);
+                break;
+            }
+            let f = stack.pop()?;
+            let set = f.acc | if f.nullable { bit(Kind::Nil) } else { 0 };
+            match stack.last_mut() {
+                None => return Some(set),
+                Some(p) => {
+                    if p.union {
+                        p.acc |= set;
+                    } else {
+                        p.acc &= set;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<L: Lookup> Gen<'_, '_, L> {
+    /// Jumps to `ok` when the kind of `v` is in `kinds` (falls through
+    /// otherwise; every kind: always jumps).
+    pub(crate) fn test_kinds(&mut self, v: Reg, kinds: KindSet, ok: bytecode_lang::Label) {
+        if kinds == ALL_KINDS {
+            self.jmp(ok);
+            return;
+        }
+        let b = self.fx.temp(ValType::Bool);
+        for code in 0..=14u8 {
+            if kinds & (1 << code) == 0 {
+                continue;
+            }
+            let Some(kind) = Kind::from_code(code) else {
+                continue;
+            };
+            self.emit(Inst::IsKind {
+                dst: b,
+                src: v,
+                kind,
+            });
+            self.jump_on(b, ok, true);
+        }
+        self.fx.release(b);
+    }
 }

@@ -1,11 +1,21 @@
-//! Assignment to places: variables, globals, and chains of index, property,
-//! and append steps, with PHP's auto-vivification and copy-on-write
-//! separation under [`ArraySemantics::Php`](crate::ArraySemantics::Php).
+//! Places: assignment, `let_place` aliases, and PHP references.
+//!
+//! A place whose root is not a plain variable (an index, property, or append
+//! chain, or a `let_place` alias) is handled in two halves. First its
+//! **operands** are evaluated once, left to right (the root when it is a
+//! value, then every index key and dynamic member name), into registers: an
+//! *evaluated place* ([`EvPlace`]). Then any number of accesses run over
+//! those registers: a read, a write (PHP auto-vivification and separation
+//! with `dsep_*`, LSB §5.16), a reference to the place (`dref_*`, LSB §5.17),
+//! or binding the place to a reference (`dbind_*`). `let_place` keeps the
+//! evaluated place alive for its body (HIR §8.2), so no operand is ever
+//! recomputed; an assignment, a reference assignment, and a place argument
+//! use one for the duration of their own code.
 
 use alloc::vec::Vec;
 
 use bytecode_lang::{Inst, Kind, Reg, ValType};
-use hir_lang::{Expr, ExprId, ItemKind, Member, NodeRef, Op, Res, Symbol};
+use hir_lang::{BinderId, Expr, ExprId, ItemKind, Member, NodeRef, Op, Res, Symbol};
 use intern_lang::Lookup;
 
 use super::{Dst, Gen, Rel, Step, Task, Val};
@@ -16,9 +26,9 @@ use crate::unit::Slot;
 /// One step of a place chain, from the root outward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PStep {
-    /// `[key]`: the key is on the value stack (normalized).
+    /// `[key]`: the key is an operand (normalized).
     Index,
-    /// `->$name`: the name is on the value stack (not normalized).
+    /// `->$name`: the name is an operand (not normalized).
     DynProp,
     /// `.name`.
     Prop(Symbol),
@@ -28,16 +38,42 @@ pub(crate) enum PStep {
     Append,
 }
 
+impl PStep {
+    /// Whether the step has a key operand.
+    fn keyed(self) -> bool {
+        matches!(self, PStep::Index | PStep::DynProp)
+    }
+}
+
 /// Where a place chain starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Root {
     /// A variable or global (written back when a write creates the array).
     Slot(Slot),
-    /// Any other expression, evaluated to a temporary (on the value stack).
+    /// Any other expression, evaluated once to a register.
     Value,
 }
 
-/// The continuation steps of assignments.
+/// Where an operand of a place comes from.
+#[derive(Clone, Copy, Debug)]
+enum Src {
+    /// An expression, evaluated now (`index`: a key PHP normalizes).
+    Expr { e: ExprId, index: bool },
+    /// A register an enclosing `let_place` already holds.
+    Reg(Reg),
+}
+
+/// A place whose operands are evaluated: the root value (for a value root)
+/// and the key of each keyed step, in registers.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EvPlace {
+    root: Option<Root>,
+    root_val: Option<Val>,
+    steps: Vec<PStep>,
+    keys: Vec<Val>,
+}
+
+/// The continuation steps of assignments and place uses.
 #[derive(Clone, Debug)]
 pub(crate) enum PlaceStep {
     /// `x op= v` for a variable in a register: `old` holds its value from
@@ -50,7 +86,7 @@ pub(crate) enum PlaceStep {
         dst: Dst,
         node: NodeRef,
     },
-    /// `x = v` / `x op= v` for a cell or global variable.
+    /// `x = v` / `x op= v` for a reference, global, or alias variable.
     Store {
         slot: Slot,
         op: Option<Op>,
@@ -59,27 +95,39 @@ pub(crate) enum PlaceStep {
         dst: Dst,
         node: NodeRef,
     },
-    /// Reads the current value at the end of a chain (compound assignment).
-    ChainRead {
+    /// Pops a place's evaluated operands into place `idx`.
+    Bind {
+        idx: u32,
         root: Root,
+        root_val: bool,
         steps: Vec<PStep>,
-        node: NodeRef,
+        nkeys: usize,
     },
+    /// Makes `binder` name place `idx` (`let_place`).
+    Alias { binder: BinderId, idx: u32 },
+    /// Pushes the value of place `idx`.
+    Read { idx: u32, node: NodeRef },
     /// Combines the old value (below) with the assigned one (on top).
     Combine { op: Op, node: NodeRef },
-    /// Writes the value on top of the stack through the chain.
-    ChainWrite {
-        root: Root,
-        steps: Vec<PStep>,
+    /// Writes the value on top of the stack to place `idx`.
+    Write {
+        idx: u32,
         dup: bool,
         dst: Dst,
         node: NodeRef,
     },
+    /// Pushes a reference to place `idx`.
+    Ref { idx: u32, node: NodeRef },
+    /// Pops a reference and makes place `idx` an alias of it; the value of
+    /// the reference assignment goes to `dst`.
+    BindRef { idx: u32, dst: Dst, node: NodeRef },
+    /// Frees place `idx`'s operand registers.
+    Drop { idx: u32 },
 }
 
 impl<L: Lookup> Gen<'_, '_, L> {
     /// The slot a path names as an assignment target.
-    fn place_slot(&self, e: ExprId) -> Result<Option<Slot>, CompileError> {
+    pub(crate) fn place_slot(&self, e: ExprId) -> Result<Option<Slot>, CompileError> {
         let node = NodeRef::Expr(e);
         let hir = self.cx.hir;
         let Expr::Path(p) = *hir.expr(e) else {
@@ -124,148 +172,218 @@ impl<L: Lookup> Gen<'_, '_, L> {
         let tnode = NodeRef::Expr(target);
         let hir = self.cx.hir;
         let dup = self.needs_dup(value);
-        match *hir.expr(target) {
-            Expr::Path(_) => {
-                let Some(slot) = self.place_slot(target)? else {
-                    return Err(CompileError::Unresolved {
-                        node: tnode,
-                        span: self.cx.span(tnode),
-                    });
-                };
-                match (slot, op) {
-                    (Slot::Reg(r), None) => {
-                        let t = self.store_expr_tasks(value, r);
-                        self.sched([
-                            t[0].clone(),
-                            t[1].clone(),
-                            Task::Push(Val {
-                                reg: r,
-                                rel: Rel::Keep,
-                            }),
-                            Task::Deliver { dst, dup: false },
-                        ]);
-                    }
-                    (Slot::Reg(r), Some(op)) => {
-                        // The old value is read before `value` runs.
-                        let (old, own_old) = if self.simple(value) {
-                            (r, false)
-                        } else {
-                            let t = self.fx.temp(ValType::Dyn);
-                            self.emit(Inst::Mov { dst: t, src: r });
-                            (t, true)
-                        };
-                        self.sched([
-                            Task::Expr(value, Dst::Any),
-                            Task::Step(Step::Place(PlaceStep::LocalCompound {
-                                op,
-                                old,
-                                own_old,
-                                reg: r,
-                                dst,
-                                node,
-                            })),
-                        ]);
-                    }
-                    (slot, op) => {
-                        let old = op.map(|_| {
-                            let t = self.fx.temp(ValType::Dyn);
-                            self.read_slot(slot, t);
-                            t
-                        });
-                        self.sched([
-                            Task::Expr(value, Dst::Any),
-                            Task::Step(Step::Place(PlaceStep::Store {
-                                slot,
-                                op,
-                                old,
-                                dup,
-                                dst,
-                                node,
-                            })),
-                        ]);
-                    }
-                }
-            }
-            Expr::Index { .. } | Expr::Field { .. } | Expr::DynField { .. } | Expr::Append(_) => {
-                let (root, root_expr, steps, keys) = self.chain(target)?;
-                if op.is_some() && steps.contains(&PStep::Append) {
-                    return Err(CompileError::NotAssignable {
-                        node: tnode,
-                        span: self.cx.span(tnode),
-                    });
-                }
-                let mut ts: Vec<Task> = Vec::new();
-                if let Some(re) = root_expr {
-                    ts.push(Task::Expr(re, Dst::Temp));
-                }
-                for (k, is_index) in keys {
-                    ts.push(Task::Expr(k, Dst::Temp));
-                    if is_index {
-                        ts.push(Task::CoerceKey(node));
-                    }
-                }
-                if let Some(op) = op {
-                    ts.push(Task::Step(Step::Place(PlaceStep::ChainRead {
-                        root,
-                        steps: steps.clone(),
-                        node,
-                    })));
-                    ts.push(Task::Expr(value, Dst::Any));
-                    ts.push(Task::Step(Step::Place(PlaceStep::Combine { op, node })));
-                } else {
-                    ts.push(Task::Expr(value, Dst::Any));
-                }
-                ts.push(Task::Step(Step::Place(PlaceStep::ChainWrite {
-                    root,
-                    steps,
-                    dup: dup && op.is_none(),
-                    dst,
-                    node,
-                })));
-                for t in ts.into_iter().rev() {
-                    self.tasks.push(t);
-                }
-            }
-            Expr::VarVar(_) => return Err(self.cx.unsupported(Unsupported::VarVar, tnode)),
-            Expr::Deref(_) => return Err(self.cx.unsupported(Unsupported::Reference, tnode)),
-            Expr::Err => {
-                return Err(CompileError::ErrorNode {
+        if let Expr::Path(_) = *hir.expr(target) {
+            let Some(slot) = self.place_slot(target)? else {
+                return Err(CompileError::Unresolved {
                     node: tnode,
                     span: self.cx.span(tnode),
                 });
+            };
+            match (slot, op) {
+                (Slot::Reg(r), None) => {
+                    let t = self.store_expr_tasks(value, r);
+                    self.sched([
+                        t[0].clone(),
+                        t[1].clone(),
+                        Task::Push(Val {
+                            reg: r,
+                            rel: Rel::Keep,
+                        }),
+                        Task::Deliver { dst, dup: false },
+                    ]);
+                }
+                (Slot::Reg(r), Some(op)) => {
+                    // The old value is read before `value` runs.
+                    let (old, own_old) = if self.simple(value) {
+                        (r, false)
+                    } else {
+                        let t = self.fx.temp(ValType::Dyn);
+                        self.emit(Inst::Mov { dst: t, src: r });
+                        (t, true)
+                    };
+                    self.sched([
+                        Task::Expr(value, Dst::Any),
+                        Task::Step(Step::Place(PlaceStep::LocalCompound {
+                            op,
+                            old,
+                            own_old,
+                            reg: r,
+                            dst,
+                            node,
+                        })),
+                    ]);
+                }
+                (slot, op) => {
+                    let old = match op {
+                        Some(_) => {
+                            let t = self.fx.temp(ValType::Dyn);
+                            self.read_slot_at(slot, t, node)?;
+                            Some(t)
+                        }
+                        None => None,
+                    };
+                    self.sched([
+                        Task::Expr(value, Dst::Any),
+                        Task::Step(Step::Place(PlaceStep::Store {
+                            slot,
+                            op,
+                            old,
+                            dup,
+                            dst,
+                            node,
+                        })),
+                    ]);
+                }
             }
-            _ => {
-                return Err(CompileError::NotAssignable {
-                    node: tnode,
-                    span: self.cx.span(tnode),
-                });
-            }
+            return Ok(());
         }
+        if op.is_some() && last_step(target, hir) == Some(PStep::Append) {
+            return Err(CompileError::NotAssignable {
+                node: tnode,
+                span: self.cx.span(tnode),
+            });
+        }
+        let (mut ts, idx) = self.place_tasks(target, false)?;
+        if let Some(op) = op {
+            ts.push(Task::Step(Step::Place(PlaceStep::Read { idx, node })));
+            ts.push(Task::Expr(value, Dst::Any));
+            ts.push(Task::Step(Step::Place(PlaceStep::Combine { op, node })));
+        } else {
+            ts.push(Task::Expr(value, Dst::Any));
+        }
+        ts.push(Task::Step(Step::Place(PlaceStep::Write {
+            idx,
+            dup: dup && op.is_none(),
+            dst,
+            node,
+        })));
+        ts.push(Task::Step(Step::Place(PlaceStep::Drop { idx })));
+        self.sched_all(ts);
         Ok(())
     }
 
-    /// Decomposes a place into its root and steps (root first), with the
-    /// key expressions to evaluate in order (and whether each is an index
-    /// key, which PHP normalizes).
+    /// `let_place binder = place in body`.
+    pub(crate) fn let_place(
+        &mut self,
+        binder: BinderId,
+        place: ExprId,
+        body: ExprId,
+        dst: Dst,
+    ) -> Result<(), CompileError> {
+        let (mut ts, idx) = self.place_tasks(place, false)?;
+        ts.push(Task::Step(Step::Place(PlaceStep::Alias { binder, idx })));
+        ts.push(Task::Expr(body, dst));
+        ts.push(Task::Step(Step::Place(PlaceStep::Drop { idx })));
+        self.sched_all(ts);
+        Ok(())
+    }
+
+    /// `target = &source`: the target place becomes an alias of the source
+    /// place's reference (made on first use: `dref_*`, or the variable's own
+    /// reference). Operands are evaluated target first, then source (PHP's
+    /// order).
+    pub(crate) fn ref_assign(
+        &mut self,
+        e: ExprId,
+        target: ExprId,
+        source: ExprId,
+        dst: Dst,
+    ) -> Result<(), CompileError> {
+        let node = NodeRef::Expr(e);
+        let (mut ts, ti) = self.place_tasks(target, true)?;
+        let (ss, si) = self.place_tasks(source, true)?;
+        ts.extend(ss);
+        ts.push(Task::Step(Step::Place(PlaceStep::Ref { idx: si, node })));
+        ts.push(Task::Step(Step::Place(PlaceStep::BindRef {
+            idx: ti,
+            dst,
+            node,
+        })));
+        ts.push(Task::Step(Step::Place(PlaceStep::Drop { idx: si })));
+        ts.push(Task::Step(Step::Place(PlaceStep::Drop { idx: ti })));
+        self.sched_all(ts);
+        Ok(())
+    }
+
+    /// Schedules the evaluation of a place's operands; returns the tasks
+    /// (ending with the step that stores them) and the place's index.
+    /// `for_ref`: the place will be referenced or bound, which an appended
+    /// element cannot be.
+    pub(crate) fn place_tasks(
+        &mut self,
+        target: ExprId,
+        for_ref: bool,
+    ) -> Result<(Vec<Task>, u32), CompileError> {
+        let node = NodeRef::Expr(target);
+        let (root, root_src, steps, keys) = self.chain(target)?;
+        if for_ref && steps.last() == Some(&PStep::Append) {
+            return Err(self.cx.unsupported(Unsupported::RefPlace, node));
+        }
+        let mut ts: Vec<Task> = Vec::with_capacity(keys.len() * 2 + 2);
+        if let Some(src) = root_src {
+            ts.push(match src {
+                Src::Expr { e, .. } => Task::Expr(e, Dst::Temp),
+                Src::Reg(reg) => Task::Push(Val {
+                    reg,
+                    rel: Rel::Keep,
+                }),
+            });
+        }
+        for k in &keys {
+            match *k {
+                Src::Expr { e, index } => {
+                    ts.push(Task::Expr(e, Dst::Temp));
+                    if index {
+                        ts.push(Task::CoerceKey(node));
+                    }
+                }
+                Src::Reg(reg) => ts.push(Task::Push(Val {
+                    reg,
+                    rel: Rel::Keep,
+                })),
+            }
+        }
+        let idx = u32::try_from(self.places.len()).unwrap_or(u32::MAX);
+        self.places.push(EvPlace::default());
+        ts.push(Task::Step(Step::Place(PlaceStep::Bind {
+            idx,
+            root,
+            root_val: root_src.is_some(),
+            steps,
+            nkeys: keys.len(),
+        })));
+        Ok((ts, idx))
+    }
+
+    /// Decomposes a place into its root, its steps (root first), and its
+    /// operands in evaluation order. A `let_place` alias inside the chain is
+    /// spliced in with the operands it already holds.
     #[allow(clippy::type_complexity)]
     fn chain(
         &self,
         target: ExprId,
-    ) -> Result<(Root, Option<ExprId>, Vec<PStep>, Vec<(ExprId, bool)>), CompileError> {
+    ) -> Result<(Root, Option<Src>, Vec<PStep>, Vec<Src>), CompileError> {
         let hir = self.cx.hir;
         let mut steps: Vec<PStep> = Vec::new();
-        let mut keys: Vec<(ExprId, bool)> = Vec::new();
+        let mut keys: Vec<Src> = Vec::new();
         let mut cur = target;
-        let root = loop {
+        let (root, root_src, prefix) = loop {
+            let node = NodeRef::Expr(cur);
             match *hir.expr(cur) {
                 Expr::Index { base, index } => {
                     steps.push(PStep::Index);
-                    keys.push((index, true));
+                    keys.push(Src::Expr {
+                        e: index,
+                        index: true,
+                    });
                     cur = base;
                 }
                 Expr::DynField { base, name } => {
                     steps.push(PStep::DynProp);
-                    keys.push((name, false));
+                    keys.push(Src::Expr {
+                        e: name,
+                        index: false,
+                    });
                     cur = base;
                 }
                 Expr::Field { base, member, .. } => {
@@ -280,9 +398,14 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     cur = base;
                 }
                 Expr::Path(_) => match self.place_slot(cur) {
-                    Ok(Some(s)) => break (Root::Slot(s), None),
+                    Ok(Some(Slot::Place(i))) => {
+                        let alias = self.places.get(i as usize).cloned().unwrap_or_default();
+                        let root = alias.root.unwrap_or(Root::Value);
+                        let src = alias.root_val.map(|v| Src::Reg(v.reg));
+                        break (root, src, Some(alias));
+                    }
+                    Ok(Some(s)) => break (Root::Slot(s), None, None),
                     Ok(None) => {
-                        let node = NodeRef::Expr(cur);
                         return Err(CompileError::Unresolved {
                             node,
                             span: self.cx.span(node),
@@ -290,44 +413,69 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     }
                     // A path that is not a variable (a function, a
                     // constant): an ordinary value root.
-                    Err(CompileError::NotAssignable { .. }) => break (Root::Value, Some(cur)),
+                    Err(CompileError::NotAssignable { .. }) => {
+                        break (
+                            Root::Value,
+                            Some(Src::Expr {
+                                e: cur,
+                                index: false,
+                            }),
+                            None,
+                        );
+                    }
                     Err(e) => return Err(e),
                 },
-                _ => break (Root::Value, Some(cur)),
+                Expr::VarVar(_) => return Err(self.cx.unsupported(Unsupported::VarVar, node)),
+                Expr::Deref(_) => return Err(self.cx.unsupported(Unsupported::Reference, node)),
+                Expr::Err => {
+                    return Err(CompileError::ErrorNode {
+                        node,
+                        span: self.cx.span(node),
+                    });
+                }
+                _ => {
+                    break (
+                        Root::Value,
+                        Some(Src::Expr {
+                            e: cur,
+                            index: false,
+                        }),
+                        None,
+                    );
+                }
             }
         };
         steps.reverse();
         keys.reverse();
-        Ok((root.0, root.1, steps, keys))
+        if let Some(alias) = prefix {
+            let mut all_steps = alias.steps.clone();
+            all_steps.extend(steps);
+            let mut all_keys: Vec<Src> = alias.keys.iter().map(|v| Src::Reg(v.reg)).collect();
+            all_keys.extend(keys);
+            return Ok((root, root_src, all_steps, all_keys));
+        }
+        Ok((root, root_src, steps, keys))
     }
 
-    pub(crate) fn ref_assign(
-        &mut self,
-        e: ExprId,
-        target: ExprId,
-        source: ExprId,
-        dst: Dst,
-    ) -> Result<(), CompileError> {
-        let node = NodeRef::Expr(e);
-        let t = self.place_slot(target).ok().flatten();
-        let s = self.place_slot(source).ok().flatten();
-        match (t, s) {
-            (Some(Slot::Cell(tc)), Some(s @ (Slot::Cell(_) | Slot::GlobalCell(_)))) => {
-                // The target variable now names the source's cell.
-                if let Some((sc, owned)) = self.cell_of(s) {
-                    self.emit(Inst::Mov { dst: tc, src: sc });
-                    if owned {
-                        self.fx.release(sc);
-                    }
-                }
-                if dst != Dst::Discard {
-                    let r = self.result_reg(dst);
-                    self.emit(Inst::CellGet { dst: r, cell: tc });
-                    self.produced(r, dst);
-                }
-                Ok(())
-            }
-            _ => Err(self.cx.unsupported(Unsupported::RefPlace, node)),
+    /// Schedules tasks so they run in the order given.
+    pub(crate) fn sched_all(&mut self, ts: Vec<Task>) {
+        for t in ts.into_iter().rev() {
+            self.tasks.push(t);
+        }
+    }
+
+    /// Takes an evaluated place out of its slot for an access (no copy of
+    /// its vectors); [`put_place`](Self::put_place) puts it back.
+    fn take_place(&mut self, idx: u32) -> EvPlace {
+        match self.places.get_mut(idx as usize) {
+            Some(p) => core::mem::take(p),
+            None => EvPlace::default(),
+        }
+    }
+
+    fn put_place(&mut self, idx: u32, p: EvPlace) {
+        if let Some(slot) = self.places.get_mut(idx as usize) {
+            *slot = p;
         }
     }
 
@@ -380,65 +528,37 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     }
                     _ => self.transfer(v, dup),
                 };
-                self.write_slot(slot, v.reg);
+                self.write_slot_at(slot, v.reg, node)?;
                 self.deliver(v, dst, false);
             }
-            PlaceStep::ChainRead { root, steps, node } => {
+            PlaceStep::Bind {
+                idx,
+                root,
+                root_val,
+                steps,
+                nkeys,
+            } => {
+                let keys = self.pop_n(nkeys);
+                let root_val = if root_val { Some(self.pop()) } else { None };
+                if let Some(slot) = self.places.get_mut(idx as usize) {
+                    *slot = EvPlace {
+                        root: Some(root),
+                        root_val,
+                        steps,
+                        keys,
+                    };
+                }
+            }
+            PlaceStep::Alias { binder, idx } => self.cx.set_slot(binder, Slot::Place(idx)),
+            PlaceStep::Read { idx, node } => {
                 self.at(node);
-                let nkeys = steps
-                    .iter()
-                    .filter(|s| matches!(s, PStep::Index | PStep::DynProp))
-                    .count();
-                let base = self.vals.len().saturating_sub(nkeys);
-                let keys: Vec<Reg> = self
-                    .vals
-                    .get(base..)
-                    .map_or(Vec::new(), |v| v.iter().map(|v| v.reg).collect());
-                let root_val = match root {
-                    Root::Value => self.vals.get(base.saturating_sub(1)).map(|v| v.reg),
-                    Root::Slot(_) => None,
-                };
-                let cur = self.fx.temp(ValType::Dyn);
-                match (root, root_val) {
-                    (Root::Slot(s), _) => self.read_slot(s, cur),
-                    (Root::Value, Some(r)) => self.emit(Inst::Mov { dst: cur, src: r }),
-                    (Root::Value, None) => self.emit(Inst::LoadNil { dst: cur }),
-                }
-                let mut ki = 0usize;
-                for s in &steps {
-                    match *s {
-                        PStep::Index | PStep::DynProp => {
-                            let k = keys.get(ki).copied().unwrap_or(Reg(0));
-                            ki += 1;
-                            self.emit(Inst::DGetIndex {
-                                dst: cur,
-                                obj: cur,
-                                key: k,
-                            });
-                        }
-                        PStep::Elem(i) => {
-                            let k = self.fx.temp(ValType::Dyn);
-                            self.load_dyn_int(k, i64::from(i));
-                            self.emit(Inst::DGetIndex {
-                                dst: cur,
-                                obj: cur,
-                                key: k,
-                            });
-                            self.fx.release(k);
-                        }
-                        PStep::Prop(name) => {
-                            let n = self.name_ref(name);
-                            self.emit(Inst::GetProp {
-                                dst: cur,
-                                obj: cur,
-                                name: n,
-                            });
-                        }
-                        PStep::Append => {}
-                    }
-                }
+                let r = self.fx.temp(ValType::Dyn);
+                let p = self.take_place(idx);
+                let done = self.place_read(&p, r, node);
+                self.put_place(idx, p);
+                done?;
                 self.vals.push(Val {
-                    reg: cur,
+                    reg: r,
                     rel: Rel::Temp,
                 });
             }
@@ -455,9 +575,8 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     rel: Rel::Temp,
                 });
             }
-            PlaceStep::ChainWrite {
-                root,
-                steps,
+            PlaceStep::Write {
+                idx,
                 dup,
                 dst,
                 node,
@@ -465,47 +584,144 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 self.at(node);
                 let v = self.pop();
                 let v = self.transfer(v, dup);
-                let nkeys = steps
-                    .iter()
-                    .filter(|s| matches!(s, PStep::Index | PStep::DynProp))
-                    .count();
-                let keys = self.pop_n(nkeys);
-                let root_val = match root {
-                    Root::Value => Some(self.pop()),
-                    Root::Slot(_) => None,
+                let p = self.take_place(idx);
+                let r = self.place_write(&p, v.reg, node);
+                self.put_place(idx, p);
+                r?;
+                self.deliver(v, dst, false);
+            }
+            PlaceStep::Ref { idx, node } => {
+                self.at(node);
+                let ct = self.cell_ty();
+                let r = self.fx.temp(ct);
+                let p = self.take_place(idx);
+                let done = self.place_ref(&p, r, node);
+                self.put_place(idx, p);
+                done?;
+                self.vals.push(Val {
+                    reg: r,
+                    rel: Rel::Temp,
+                });
+            }
+            PlaceStep::BindRef { idx, dst, node } => {
+                self.at(node);
+                let src = self.pop();
+                let p = self.take_place(idx);
+                let r = self.place_bind(&p, src.reg, node);
+                self.put_place(idx, p);
+                r?;
+                if dst != Dst::Discard {
+                    let r = self.result_reg(dst);
+                    self.emit(Inst::CellGet {
+                        dst: r,
+                        cell: src.reg,
+                    });
+                    self.produced(r, dst);
+                }
+                self.release(src);
+            }
+            PlaceStep::Drop { idx } => {
+                let p = match self.places.get_mut(idx as usize) {
+                    Some(slot) => core::mem::take(slot),
+                    None => EvPlace::default(),
                 };
-                self.chain_write(root, root_val.map(|r| r.reg), &steps, &keys, v.reg);
-                for k in keys {
+                for k in p.keys {
                     self.release(k);
                 }
-                if let Some(r) = root_val {
+                if let Some(r) = p.root_val {
                     self.release(r);
                 }
-                self.deliver(v, dst, false);
             }
         }
         Ok(())
     }
 
-    /// Writes `v` through the chain.
-    fn chain_write(
-        &mut self,
-        root: Root,
-        root_val: Option<Reg>,
-        steps: &[PStep],
-        keys: &[Val],
-        v: Reg,
-    ) {
-        let php = self.php();
-        let map_ty = self.map_ty();
-        let tr = self.map_ref();
-        let cur = self.fx.temp(ValType::Dyn);
-        let b = self.fx.temp(ValType::Bool);
-        match (root, root_val) {
-            (Root::Slot(s), _) => self.read_slot(s, cur),
-            (Root::Value, Some(r)) => self.emit(Inst::Mov { dst: cur, src: r }),
-            (Root::Value, None) => self.emit(Inst::LoadNil { dst: cur }),
+    // ------------------------------------------------------------ accesses
+
+    /// The key of a step as a `dyn` register, and whether the caller frees
+    /// it.
+    fn step_key(&mut self, s: PStep, keys: &[Val], ki: &mut usize) -> Option<(Reg, bool)> {
+        match s {
+            PStep::Index | PStep::DynProp => {
+                let k = keys.get(*ki).map_or(Reg(0), |v| v.reg);
+                *ki += 1;
+                Some((k, false))
+            }
+            PStep::Elem(n) => {
+                let k = self.fx.temp(ValType::Dyn);
+                self.load_dyn_int(k, i64::from(n));
+                Some((k, true))
+            }
+            PStep::Prop(_) | PStep::Append => None,
         }
+    }
+
+    /// Loads the root of a chain into a new temporary.
+    fn load_root(&mut self, p: &EvPlace, node: NodeRef) -> Result<Reg, CompileError> {
+        let cur = self.fx.temp(ValType::Dyn);
+        match (p.root, p.root_val) {
+            (Some(Root::Slot(s)), _) => self.read_slot_at(s, cur, node)?,
+            (_, Some(v)) => self.emit(Inst::Mov {
+                dst: cur,
+                src: v.reg,
+            }),
+            _ => self.emit(Inst::LoadNil { dst: cur }),
+        }
+        Ok(cur)
+    }
+
+    /// `dst = place` (no auto-vivification: a missing key raises, or goes
+    /// to the `get_index` hook, as a read does).
+    pub(crate) fn place_read(
+        &mut self,
+        p: &EvPlace,
+        dst: Reg,
+        node: NodeRef,
+    ) -> Result<(), CompileError> {
+        let cur = self.load_root(p, node)?;
+        let mut ki = 0usize;
+        for &s in &p.steps {
+            if s == PStep::Append {
+                return Err(CompileError::NotAssignable {
+                    node,
+                    span: self.cx.span(node),
+                });
+            }
+            match (s, self.step_key(s, &p.keys, &mut ki)) {
+                (PStep::Prop(name), _) => {
+                    let n = self.name_ref(name);
+                    self.emit(Inst::GetProp {
+                        dst: cur,
+                        obj: cur,
+                        name: n,
+                    });
+                }
+                (_, Some((k, own))) => {
+                    self.emit(Inst::DGetIndex {
+                        dst: cur,
+                        obj: cur,
+                        key: k,
+                    });
+                    if own {
+                        self.fx.release(k);
+                    }
+                }
+                (_, None) => {}
+            }
+        }
+        self.emit(Inst::Mov { dst, src: cur });
+        self.fx.release(cur);
+        Ok(())
+    }
+
+    /// The container the last step of a place writes into, in a new
+    /// temporary: the root, then every step but the last, creating missing
+    /// or null intermediate arrays and separating shared ones under PHP
+    /// arrays (LSB §5.16).
+    fn place_container(&mut self, p: &EvPlace, node: NodeRef) -> Result<Reg, CompileError> {
+        let php = self.php();
+        let cur = self.load_root(p, node)?;
+        let b = self.fx.temp(ValType::Bool);
         if php {
             // Writing into null creates the array (auto-vivification).
             let have = self.label();
@@ -518,87 +734,58 @@ impl<L: Lookup> Gen<'_, '_, L> {
             let m = self.new_map();
             self.emit(Inst::Mov { dst: cur, src: m });
             self.fx.release(m);
-            if let Root::Slot(s) = root {
-                self.write_slot(s, cur);
+            if let Some(Root::Slot(s)) = p.root {
+                self.write_slot_at(s, cur, node)?;
             }
             self.bind(have);
         }
         let mut ki = 0usize;
-        let last = steps.len().saturating_sub(1);
-        for (i, s) in steps.iter().enumerate() {
-            // The key of a keyed step, as a `dyn` value.
-            let (key, own) = match *s {
-                PStep::Index | PStep::DynProp => {
-                    let k = keys.get(ki).map_or(Reg(0), |v| v.reg);
-                    ki += 1;
-                    (Some(k), false)
-                }
-                PStep::Elem(n) => {
-                    let k = self.fx.temp(ValType::Dyn);
-                    self.load_dyn_int(k, i64::from(n));
-                    (Some(k), true)
-                }
-                PStep::Prop(name) => (Some(self.load_name(name)), true),
-                PStep::Append => (None, false),
-            };
+        let last = p.steps.len().saturating_sub(1);
+        for (i, &s) in p.steps.iter().enumerate() {
             if i == last {
-                match (*s, key) {
-                    (PStep::Prop(name), _) => {
-                        let n = self.name_ref(name);
-                        self.emit(Inst::SetProp {
-                            obj: cur,
-                            name: n,
-                            src: v,
-                        });
-                    }
-                    (PStep::Append, _) => {
-                        let bad = self.label();
-                        let done = self.label();
-                        self.emit(Inst::IsType {
-                            dst: b,
-                            src: cur,
-                            ty: tr,
-                        });
-                        self.jump_on(b, bad, false);
-                        let m = self.fx.temp(map_ty);
-                        self.emit(Inst::Cast {
-                            dst: m,
-                            src: cur,
-                            ty: tr,
-                        });
-                        self.emit(Inst::MapPush { map: m, src: v });
-                        self.fx.release(m);
-                        self.jmp(done);
-                        self.bind(bad);
-                        self.raise_type_error();
-                        self.bind(done);
-                    }
-                    (_, Some(k)) => self.emit(Inst::DSetIndex {
-                        obj: cur,
-                        key: k,
-                        src: v,
-                    }),
-                    (_, None) => {}
-                }
-            } else {
-                self.chain_step(*s, cur, key, b, php);
+                break;
             }
-            if own {
-                if let Some(k) = key {
-                    self.fx.release(k);
-                }
+            let key = self.step_key(s, &p.keys, &mut ki);
+            self.descend(s, cur, key.map(|(k, _)| k), b, php);
+            if let Some((k, true)) = key {
+                self.fx.release(k);
             }
         }
         self.fx.release(b);
-        self.fx.release(cur);
+        Ok(cur)
     }
 
-    /// Moves `cur` one intermediate step down a write chain: to the child
-    /// array, creating it when absent or null (PHP), separating it from any
-    /// copy that shares it (PHP), and storing it back into its container.
-    fn chain_step(&mut self, s: PStep, cur: Reg, key: Option<Reg>, b: Reg, php: bool) {
-        let map_ty = self.map_ty();
-        let tr = self.map_ref();
+    /// Moves `cur` one intermediate step down a write chain.
+    fn descend(&mut self, s: PStep, cur: Reg, key: Option<Reg>, b: Reg, php: bool) {
+        if s == PStep::Append {
+            // `$a[][...] = v`: a new array appended to a map.
+            let map_ty = self.map_ty();
+            let tr = self.map_ref();
+            let bad = self.label();
+            let done = self.label();
+            self.emit(Inst::IsType {
+                dst: b,
+                src: cur,
+                ty: tr,
+            });
+            self.jump_on(b, bad, false);
+            let m = self.fx.temp(map_ty);
+            self.emit(Inst::Cast {
+                dst: m,
+                src: cur,
+                ty: tr,
+            });
+            let n = self.new_map();
+            self.emit(Inst::MapPush { map: m, src: n });
+            self.emit(Inst::Mov { dst: cur, src: n });
+            self.fx.release(n);
+            self.fx.release(m);
+            self.jmp(done);
+            self.bind(bad);
+            self.raise_type_error();
+            self.bind(done);
+            return;
+        }
         if !php {
             // Shared references: read the child as an expression would.
             match (s, key) {
@@ -609,48 +796,47 @@ impl<L: Lookup> Gen<'_, '_, L> {
                         obj: cur,
                         name: n,
                     });
-                    return;
                 }
-                (PStep::Append, _) => {}
-                (_, Some(k)) => {
-                    self.emit(Inst::DGetIndex {
-                        dst: cur,
-                        obj: cur,
-                        key: k,
-                    });
-                    return;
-                }
-                (_, None) => return,
+                (_, Some(k)) => self.emit(Inst::DGetIndex {
+                    dst: cur,
+                    obj: cur,
+                    key: k,
+                }),
+                (_, None) => {}
             }
+            return;
         }
-        let other = self.label();
-        let done = self.label();
-        self.emit(Inst::IsType {
-            dst: b,
-            src: cur,
-            ty: tr,
-        });
-        self.jump_on(b, other, false);
-        let m = self.fx.temp(map_ty);
-        self.emit(Inst::Cast {
-            dst: m,
-            src: cur,
-            ty: tr,
-        });
+        // PHP: separate the child if another container may share it, and
+        // create it when it is absent or null.
+        let child = self.fx.temp(ValType::Dyn);
+        let have = self.label();
         match (s, key) {
-            (PStep::Append, _) => {
-                // `$a[][...] = v`: a new array appended.
-                let n = self.new_map();
-                self.emit(Inst::MapPush { map: m, src: n });
-                self.emit(Inst::Mov { dst: cur, src: n });
-                self.fx.release(n);
-            }
-            (_, Some(k)) if php => {
-                let sep = self.label();
-                let child = self.fx.temp(ValType::Dyn);
-                self.emit(Inst::MapFind {
+            (PStep::Prop(name), _) => {
+                let n = self.name_ref(name);
+                self.emit(Inst::DSepProp {
                     dst: child,
-                    map: m,
+                    obj: cur,
+                    name: n,
+                });
+                self.emit(Inst::IsKind {
+                    dst: b,
+                    src: child,
+                    kind: Kind::Nil,
+                });
+                self.jump_on(b, have, false);
+                let m = self.new_map();
+                self.emit(Inst::Mov { dst: child, src: m });
+                self.fx.release(m);
+                self.emit(Inst::SetProp {
+                    obj: cur,
+                    name: n,
+                    src: child,
+                });
+            }
+            (_, Some(k)) => {
+                self.emit(Inst::DSepIndex {
+                    dst: child,
+                    obj: cur,
                     key: k,
                 });
                 self.emit(Inst::IsKind {
@@ -658,68 +844,235 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     src: child,
                     kind: Kind::Nil,
                 });
-                self.jump_on(b, sep, false);
-                let n = self.new_map();
-                self.emit(Inst::Mov { dst: child, src: n });
-                self.fx.release(n);
-                self.emit(Inst::MapSet {
-                    map: m,
+                self.jump_on(b, have, false);
+                let m = self.new_map();
+                self.emit(Inst::Mov { dst: child, src: m });
+                self.fx.release(m);
+                self.emit(Inst::DSetIndex {
+                    obj: cur,
                     key: k,
                     src: child,
                 });
-                self.emit(Inst::Mov {
-                    dst: cur,
-                    src: child,
-                });
-                self.jmp(done);
-                self.bind(sep);
-                let keep = self.label();
-                self.emit(Inst::IsKind {
-                    dst: b,
-                    src: child,
-                    kind: Kind::Map,
-                });
-                self.jump_on(b, keep, false);
-                self.emit(Inst::Dup {
-                    dst: child,
-                    src: child,
-                });
-                self.emit(Inst::MapSet {
-                    map: m,
-                    key: k,
-                    src: child,
-                });
-                self.bind(keep);
-                self.emit(Inst::Mov {
-                    dst: cur,
-                    src: child,
-                });
-                self.fx.release(child);
             }
-            (_, _) => {}
+            (_, None) => {}
         }
-        self.fx.release(m);
-        self.jmp(done);
-        // Not a map: the dynamic instructions (and their hooks) decide.
-        self.bind(other);
-        match (s, key) {
+        self.bind(have);
+        self.emit(Inst::Mov {
+            dst: cur,
+            src: child,
+        });
+        self.fx.release(child);
+    }
+
+    /// `place = v`.
+    pub(crate) fn place_write(
+        &mut self,
+        p: &EvPlace,
+        v: Reg,
+        node: NodeRef,
+    ) -> Result<(), CompileError> {
+        let Some(&last) = p.steps.last() else {
+            return match p.root {
+                Some(Root::Slot(s)) => self.write_slot_at(s, v, node),
+                _ => Err(CompileError::NotAssignable {
+                    node,
+                    span: self.cx.span(node),
+                }),
+            };
+        };
+        let cur = self.place_container(p, node)?;
+        let mut ki = p.steps.iter().filter(|s| s.keyed()).count();
+        if last.keyed() {
+            ki -= 1;
+        }
+        match (last, self.step_key(last, &p.keys, &mut ki)) {
             (PStep::Prop(name), _) => {
                 let n = self.name_ref(name);
-                self.emit(Inst::GetProp {
-                    dst: cur,
+                self.emit(Inst::SetProp {
+                    obj: cur,
+                    name: n,
+                    src: v,
+                });
+            }
+            (PStep::Append, _) => {
+                let map_ty = self.map_ty();
+                let tr = self.map_ref();
+                let b = self.fx.temp(ValType::Bool);
+                let bad = self.label();
+                let done = self.label();
+                self.emit(Inst::IsType {
+                    dst: b,
+                    src: cur,
+                    ty: tr,
+                });
+                self.jump_on(b, bad, false);
+                let m = self.fx.temp(map_ty);
+                self.emit(Inst::Cast {
+                    dst: m,
+                    src: cur,
+                    ty: tr,
+                });
+                self.emit(Inst::MapPush { map: m, src: v });
+                self.fx.release(m);
+                self.jmp(done);
+                self.bind(bad);
+                self.raise_type_error();
+                self.bind(done);
+                self.fx.release(b);
+            }
+            (_, Some((k, own))) => {
+                self.emit(Inst::DSetIndex {
+                    obj: cur,
+                    key: k,
+                    src: v,
+                });
+                if own {
+                    self.fx.release(k);
+                }
+            }
+            (_, None) => {}
+        }
+        self.fx.release(cur);
+        Ok(())
+    }
+
+    /// `dst = &place`: the variable's reference, or a reference to the slot
+    /// (`dref_*`: the slot becomes a reference slot, LSB §5.17).
+    pub(crate) fn place_ref(
+        &mut self,
+        p: &EvPlace,
+        dst: Reg,
+        node: NodeRef,
+    ) -> Result<(), CompileError> {
+        let Some(&last) = p.steps.last() else {
+            return match p.root {
+                Some(Root::Slot(Slot::Cell(c))) => {
+                    self.emit(Inst::Mov { dst, src: c });
+                    Ok(())
+                }
+                Some(Root::Slot(Slot::GlobalCell(g))) => {
+                    self.emit(Inst::GetGlobal { dst, global: g });
+                    Ok(())
+                }
+                _ => Err(self.cx.unsupported(Unsupported::RefPlace, node)),
+            };
+        };
+        let cur = self.place_container(p, node)?;
+        let mut ki = p.steps.iter().filter(|s| s.keyed()).count();
+        if last.keyed() {
+            ki -= 1;
+        }
+        match (last, self.step_key(last, &p.keys, &mut ki)) {
+            (PStep::Prop(name), _) => {
+                let n = self.name_ref(name);
+                self.emit(Inst::DRefProp {
+                    dst,
                     obj: cur,
                     name: n,
                 });
             }
-            (PStep::Append, _) => self.raise_type_error(),
-            (_, Some(k)) => self.emit(Inst::DGetIndex {
-                dst: cur,
-                obj: cur,
-                key: k,
-            }),
-            (_, None) => {}
+            (_, Some((k, own))) => {
+                self.emit(Inst::DRefIndex {
+                    dst,
+                    obj: cur,
+                    key: k,
+                });
+                if own {
+                    self.fx.release(k);
+                }
+            }
+            _ => return Err(self.cx.unsupported(Unsupported::RefPlace, node)),
         }
-        self.bind(done);
+        self.fx.release(cur);
+        Ok(())
+    }
+
+    /// Makes the place an alias of the reference in `src`: a variable now
+    /// names it; a slot becomes it (`dbind_*`).
+    fn place_bind(&mut self, p: &EvPlace, src: Reg, node: NodeRef) -> Result<(), CompileError> {
+        let Some(&last) = p.steps.last() else {
+            return match p.root {
+                Some(Root::Slot(Slot::Cell(c))) => {
+                    self.emit(Inst::Mov { dst: c, src });
+                    Ok(())
+                }
+                Some(Root::Slot(Slot::GlobalCell(g))) => {
+                    self.emit(Inst::SetGlobal { global: g, src });
+                    Ok(())
+                }
+                _ => Err(self.cx.unsupported(Unsupported::RefPlace, node)),
+            };
+        };
+        let cur = self.place_container(p, node)?;
+        let mut ki = p.steps.iter().filter(|s| s.keyed()).count();
+        if last.keyed() {
+            ki -= 1;
+        }
+        match (last, self.step_key(last, &p.keys, &mut ki)) {
+            (PStep::Prop(name), _) => {
+                let n = self.name_ref(name);
+                self.emit(Inst::DBindProp {
+                    obj: cur,
+                    name: n,
+                    src,
+                });
+            }
+            (_, Some((k, own))) => {
+                self.emit(Inst::DBindIndex {
+                    obj: cur,
+                    key: k,
+                    src,
+                });
+                if own {
+                    self.fx.release(k);
+                }
+            }
+            _ => return Err(self.cx.unsupported(Unsupported::RefPlace, node)),
+        }
+        self.fx.release(cur);
+        Ok(())
+    }
+
+    /// Reads a variable, an alias included.
+    pub(crate) fn read_slot_at(
+        &mut self,
+        slot: Slot,
+        dst: Reg,
+        node: NodeRef,
+    ) -> Result<(), CompileError> {
+        match slot {
+            Slot::Place(i) => {
+                let p = self.take_place(i);
+                let r = self.place_read(&p, dst, node);
+                self.put_place(i, p);
+                r
+            }
+            s => {
+                self.read_var(s, dst);
+                Ok(())
+            }
+        }
+    }
+
+    /// Writes a variable, an alias included.
+    pub(crate) fn write_slot_at(
+        &mut self,
+        slot: Slot,
+        src: Reg,
+        node: NodeRef,
+    ) -> Result<(), CompileError> {
+        match slot {
+            Slot::Place(i) => {
+                let p = self.take_place(i);
+                let r = self.place_write(&p, src, node);
+                self.put_place(i, p);
+                r
+            }
+            s => {
+                self.write_var(s, src);
+                Ok(())
+            }
+        }
     }
 
     /// Normalizes a map key (PHP key coercion): integers pass; anything else
@@ -764,5 +1117,20 @@ impl<L: Lookup> Gen<'_, '_, L> {
             reg: out,
             rel: Rel::Temp,
         }
+    }
+}
+
+/// The last step of a place expression (without resolving aliases): what an
+/// `Append` check needs before anything is evaluated.
+fn last_step(e: ExprId, hir: &hir_lang::Hir) -> Option<PStep> {
+    match *hir.expr(e) {
+        Expr::Append(_) => Some(PStep::Append),
+        Expr::Index { .. } => Some(PStep::Index),
+        Expr::DynField { .. } => Some(PStep::DynProp),
+        Expr::Field { member, .. } => Some(match member {
+            Member::Named(s) => PStep::Prop(s),
+            Member::Index(i) => PStep::Elem(i),
+        }),
+        _ => None,
     }
 }

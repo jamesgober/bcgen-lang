@@ -199,8 +199,8 @@ fn functions_defaults_named_rest() {
 }
 
 #[test]
-fn argument_errors_raise_at_the_callee() {
-    // fn g(a) { a }   g(1, 2)  -> TypeError at g
+fn argument_errors_raise_at_the_call() {
+    // fn g(a) { a }   g(1, 2)  -> ArgumentError (E0114) at the call
     let mut h = H::new();
     let (pa, a) = h.param("a", ParamKind::Normal, None, false);
     let va = h.var(a);
@@ -215,8 +215,8 @@ fn argument_errors_raise_at_the_callee() {
     assert_eq!(
         o,
         Outcome::Raised {
-            code: 100,
-            node: hir_lang::NodeRef::Item(g)
+            code: 114,
+            node: hir_lang::NodeRef::Expr(call)
         }
     );
 }
@@ -468,7 +468,8 @@ fn uncaught_throw_reports_the_rethrowing_try() {
 #[test]
 fn match_sequential_patterns() {
     // [ m(0), m(5), m(15), m([1, 2]), m("s"), m(0.5) ] where
-    // m(x) = match x { 0 => "zero", 1..=9 => "small", (a, b) => a + b, s: str => "str", y if y > 10 => "big" }
+    // m(x) = match x { 0 => "zero", 1..=9 => "small", (a, b) => a + b, s: str => "str",
+    //                  y if y > 10 => "big", _ => null }
     let mut h = H::new();
     let (px, x) = h.param("x", ParamKind::Normal, None, false);
     let vx = h.var(x);
@@ -504,7 +505,10 @@ fn match_sequential_patterns() {
     let g = h.op(OpKind::Gt, &[vy, ten]);
     let big = h.str("big");
     let a4 = h.arm(py, Some(g), big);
-    let m = h.match_(vx, &[a0, a1, a2, a3, a4]);
+    let w = h.pat(Pat::Wild);
+    let null = h.nil();
+    let a5 = h.arm(w, None, null);
+    let m = h.match_(vx, &[a0, a1, a2, a3, a4, a5]);
     let mb = h.block(&[], Some(m));
     let mf = h.func("m", &[px], mb, DefaultEval::PerCall);
     let mut calls = Vec::new();

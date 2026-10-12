@@ -8,8 +8,7 @@ use bcgen_lang::{BodyMode, CompileError, Compiler, Options, Unsupported};
 use bvm_lang::{Host, Program, Value, Vm};
 use common::hb::H;
 use hir_lang::{
-    ClassDef, DefaultEval, Effects, Expr, FnDef, IntLit, Item, ItemKind, Lit, NodeRef, OpKind,
-    ParamKind, Prim, Ty,
+    ClassDef, DefaultEval, Expr, IntLit, Item, ItemKind, Lit, NodeRef, OpKind, ParamKind, Prim, Ty,
 };
 
 fn entry() -> Options {
@@ -98,10 +97,13 @@ fn the_instruction_budget_is_enforced() {
 
 #[test]
 fn too_many_parameters_is_an_error() {
+    // With a default: the presence mask carries 64.
     let mut h = H::new();
-    let params: Vec<_> = (0..65)
+    let mut params: Vec<_> = (0..64)
         .map(|i| h.param(&format!("p{i}"), ParamKind::Normal, None, false).0)
         .collect();
+    let d = h.int(1);
+    params.push(h.param("last", ParamKind::Normal, Some(d), false).0);
     let body = h.block(&[], None);
     let f = h.func("wide", &params, body, DefaultEval::PerCall);
     let (hir, names) = h.finish(&[f], None);
@@ -110,6 +112,28 @@ fn too_many_parameters_is_an_error() {
         matches!(err, CompileError::TooManyParams { limit: 64, .. }),
         "{err:?}"
     );
+    // Without: an LSB parameter list carries 255.
+    let mut h = H::new();
+    let params: Vec<_> = (0..256)
+        .map(|i| h.param(&format!("p{i}"), ParamKind::Normal, None, false).0)
+        .collect();
+    let body = h.block(&[], None);
+    let f = h.func("wider", &params, body, DefaultEval::PerCall);
+    let (hir, names) = h.finish(&[f], None);
+    let err = bcgen_lang::compile(&hir, &names).unwrap_err();
+    assert!(
+        matches!(err, CompileError::TooManyParams { limit: 255, .. }),
+        "{err:?}"
+    );
+    // 255 compile and run.
+    let mut h = H::new();
+    let params: Vec<_> = (0..255)
+        .map(|i| h.param(&format!("p{i}"), ParamKind::Normal, None, false).0)
+        .collect();
+    let body = h.block(&[], None);
+    let f = h.func("widest", &params, body, DefaultEval::PerCall);
+    let (hir, names) = h.finish(&[f], None);
+    assert!(bcgen_lang::compile(&hir, &names).is_ok());
 }
 
 fn unsupported(
@@ -126,27 +150,6 @@ fn feature(e: CompileError) -> Unsupported {
         CompileError::Unsupported { feature, .. } => feature,
         e => panic!("not an unsupported form: {e:?}"),
     }
-}
-
-#[test]
-fn coroutines_are_reported_for_0_5() {
-    let e = unsupported(|h| {
-        let y = h.expr(Expr::Yield(None));
-        let body = h.block(&[], Some(y));
-        h.tick();
-        let n = h.name("gen");
-        let f = h.b.item(Item::new(
-            Some(n),
-            ItemKind::Fn(FnDef {
-                body: Some(body),
-                effects: Effects::YIELD,
-                ..FnDef::default()
-            }),
-        ));
-        (vec![f], None)
-    });
-    assert_eq!(feature(e), Unsupported::Coroutine);
-    assert!(Unsupported::Coroutine.to_string().contains("0.5"));
 }
 
 #[test]
@@ -231,20 +234,23 @@ fn big_integers_and_out_of_range_literals_are_reported() {
 }
 
 #[test]
-fn reference_assignment_to_an_element_is_reported() {
+fn a_reference_to_an_appended_element_is_reported() {
+    // $a[] = &$r: the new element's key is known only after the append.
     let e = unsupported(|h| {
         let a = h.local("a");
         let arr = h.array(&[]);
         let la = h.let_(a, Some(arr));
+        let r = h.local("r");
+        let nil = h.nil();
+        let lr = h.let_(r, Some(nil));
         let va = h.var(a);
-        let z = h.int(0);
-        let ix = h.index(va, z);
-        let vb = h.var(a);
-        let r = h.expr(Expr::RefAssign {
-            target: ix,
-            source: vb,
+        let app = h.append(va);
+        let vr = h.var(r);
+        let x = h.expr(Expr::RefAssign {
+            target: app,
+            source: vr,
         });
-        let body = h.block(&[la], Some(r));
+        let body = h.block(&[la, lr], Some(x));
         (vec![], Some(body))
     });
     assert_eq!(feature(e), Unsupported::RefPlace);
@@ -296,7 +302,7 @@ fn unknown_intrinsics_and_wrong_arity_are_reported() {
         let x = h.intrinsic("nope", &[]);
         (vec![], Some(x))
     });
-    assert_eq!(feature(e), Unsupported::Intrinsic);
+    assert!(matches!(e, CompileError::UnknownIntrinsic { .. }), "{e:?}");
     let e = unsupported(|h| {
         let one = h.int(1);
         let two = h.int(2);
@@ -304,7 +310,10 @@ fn unknown_intrinsics_and_wrong_arity_are_reported() {
         (vec![], Some(x))
     });
     assert!(
-        matches!(e, CompileError::IntrinsicArity { expected: 1, .. }),
+        matches!(
+            e,
+            CompileError::IntrinsicArity { arity, found: 2, .. } if arity == bcgen_lang::Arity::exact(1)
+        ),
         "{e:?}"
     );
 }

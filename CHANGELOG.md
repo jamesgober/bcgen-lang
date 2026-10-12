@@ -13,6 +13,140 @@
 
 ---
 
+## [0.3.0] - 2026-10-12
+
+HIR spec v3 (hir-lang 0.4) to **LSB format 2** (bytecode-lang 0.3), which
+bvm-lang 2.0.0-alpha.3 executes, with the named intrinsics Mox needs. This
+release unblocks the LexerSketch Demo chain (lang-forge → lower-lang →
+resolve-lang → typeck-lang → bcgen-lang → bvm-lang): it is on the hir-lang
+version typeck-lang 0.3 uses, emits the bytecode format the VM reads, and
+compiles every intrinsic of the Mox sketch.
+
+### Breaking
+
+- **hir-lang 0.4 and bytecode-lang 0.3.** `compile` takes a hir-lang 0.4
+  `Hir`; `Compiled::module` is an LSB format 2 module (bytecode-lang 0.3);
+  `Options::with_hook` takes bytecode-lang 0.3's `Hook`. Format 1 modules are
+  no longer produced.
+- **The calling convention is LSB §5.15's.** Every function item and closure
+  is one LSB function carrying its **parameter list**; function values and
+  dynamic calls (`dcall`, `dcall_shape`) bind through it in the VM. The 0.2
+  argument packets, the `<name>$dyn` entries, and the closures' `(dyn, dyn)`
+  signature are gone: a closure's function takes its parameters and presence
+  mask like a function item's.
+- **Binding errors are `ArgumentError` (E0114) at the call**, as LSB raises
+  them (0.2: `TypeError` at the callee's definition): a positional argument
+  after a named one, too many or too few arguments, an unknown or repeated
+  name.
+- **HIR `rest` parameters are LSB `rest_map`** (PHP 8.1's `...$args`): with
+  no named-rest parameter, unknown named arguments are collected into the
+  rest map under their names instead of raising.
+- **A `match` with no matching arm raises `NoMatch` (E0200)** with the
+  scrutinee as payload (HIR v3 §8.10); 0.2 evaluated it to `nil`. Lowerings
+  that want `nil` add a final wildcard arm.
+- **`OpKind::Not` is logical only** (`dnot`, HIR v3); the bitwise complement
+  is `OpKind::BitNot` (`dbit_not`). `abs` is LSB's `dabs`: a non-number goes
+  to the `abs` hook when one is bound.
+- **Shared variables live in LSB references** (`new_ref`, kind `reference`),
+  not cells, so they can be bound into array slots.
+- **Named intrinsics are table-driven.** `Options::new()` uses
+  `Intrinsics::core()` (the 0.2 built-ins plus coroutine controls); a name
+  outside the table is the new `CompileError::UnknownIntrinsic` (0.2:
+  `Unsupported::Intrinsic`), and `CompileError::IntrinsicArity` carries
+  `arity: Arity` and `found: u32` (was `expected: u32`).
+- **`CompileError`** gains `UnknownIntrinsic` and `TooManyArgs`;
+  `TooManyParams` allows 255 parameters without defaults (64 with one, as
+  before). **`Unsupported::Coroutine` is removed** (coroutines compile), and
+  `Unsupported::RefPlace` now covers only references to appended elements,
+  variable variables, and non-places.
+- **Dev-dependencies**: bvm-lang `=2.0.0-alpha.3`; resolve-lang is dropped
+  (resolve-lang 0.3 is built on hir-lang 0.3, so it cannot resolve a 0.4
+  unit).
+
+### Added
+
+- **Generators**: functions and closures with `YIELD` make coroutines
+  (`coro_new` of a generated body; a generator closure's captures pass as
+  leading arguments); keyed `yield` (`yield_kv`) and automatic keys
+  (`yield`); `yield from` by the delegation loop of HIR v3 §8.7 (keys
+  preserved, sent values forwarded with `resume`, thrown errors with
+  `resume_throw`, an inner `await` passed through, the return value as the
+  result; arrays and other iterables yielded entry by entry).
+- **`await`** and **`spawn`** (through the module's `spawn` hook); `ASYNC`
+  functions compile as ordinary functions on LSB's stackful model.
+- **`let_place`** (HIR v3 §8.2): a place's operands evaluated once into
+  registers; reads, writes, references, and further steps through the alias,
+  so `.=` through a host operator, `++`, and `??=` evaluate their place once.
+  **Assignments evaluate to the value written.**
+- **PHP references into elements and properties**: `$x = &$a[k]`
+  (`dref_index`/`dref_prop`), `$a[k] = &$x` (`dbind_index`/`dbind_prop`),
+  element place arguments to by-reference parameters, and run-time
+  by-reference decisions for dynamic calls (`dparam_ref`,
+  `dparam_ref_named`), each place's operands evaluated once.
+- **Copy-on-write separation that copies only what is shared**: nested
+  writes separate with `dsep_index`/`dsep_prop` (LSB §5.16).
+- **OPS v2**: `pow` (`dpow`, every overflow policy, `NegativeExponent`),
+  `bit_not`, `shift = saturate`, `abs` through `dabs`.
+- **Union and intersection types** in type-test patterns and casts (a
+  checked identity), nested to any depth.
+- **The intrinsic table** (decision D27): `Intrinsics` (`new`, `core`, `mox`,
+  `with_lsb`, `with_host`, `with_fast`, `get`, `len`, `is_empty`, `iter`),
+  `IntrinsicDef`, `Lowering` (an LSB sequence, a host function, or a guarded
+  fast path over one), `LsbOp`, `Fast`, `Arity`; `Options::with_intrinsics`
+  and `Options::intrinsics`. `Intrinsics::mox()` maps every intrinsic of
+  `mox.lsf` (`concat`, `concat_n`, `mod`, `pow`, `shl`, `shr`, `xor`,
+  `loose_eq`, `loose_ne`, `identical`, `not_identical`, `lt`, `le`, `gt`,
+  `ge`, `spaceship`, `to_number`, `bit_not`, `cast_int`, `cast_float`,
+  `cast_string`, `cast_bool`, `cast_array`, `cast_object`, `instanceof`,
+  `clone`), each documented with its PHP semantics in `docs/API.md`.
+- Core intrinsics `resume`, `resume_throw`, `coro_close`, `coro_key`,
+  `coro_result`, `coro_status` (a runtime's generator object lowers to them),
+  and `err_code`, `err_payload` (a runtime's exception mapping reads a caught
+  error's code and payload with them).
+- Hooks `pow`, `abs`, and `call_shape` can be bound (`Options::with_hook`).
+- Tests: `tests/features_0_3.rs` (every new form on bvm-lang),
+  `tests/intrinsics.rs` (every Mox mapping against a PHP-semantics test host;
+  each fast path exact on its documented domain and calling the host exactly
+  outside it), `tests/binding.rs` (compile-time arrangement against the VM's
+  binder on random parameter and argument lists), `tests/hostile.rs` (random
+  HIR of every form, repaired by `finish_lenient`, never panics; deep nests
+  on a small stack); the reference interpreter and the program generator gain
+  `let_place`, `pow`, `bit_not`, saturating shifts, union type tests, LSB
+  binding, and `NoMatch`.
+- Benchmarks: a generator, `let_place` updates, dynamic calls with named
+  arguments, by-reference element arguments, and `mox.loose_eq`'s fast path.
+- `examples/mox_intrinsics.rs`.
+
+### Changed
+
+- The end-to-end test resolves its hand-lowered Mox program with a small
+  lexical resolver in the test instead of resolve-lang.
+- The result of a host call or an intrinsic is copied when stored under PHP
+  arrays (a host function may return its argument).
+
+### Fixed
+
+- Nested writes (`$g[$i % 64][] = $i`) no longer copy the inner array on
+  every write: 18 times faster on the 100k benchmark.
+- A by-value place argument to a dynamic call is read when it is evaluated,
+  not when the callee binds it.
+
+### Migration from 0.2
+
+| 0.2 | 0.3 |
+|---|---|
+| `hir-lang = "0.3"`, `bytecode-lang = "0.2"`, bvm-lang `2.0.0-alpha.1` | `hir-lang = "0.4"`, `bytecode-lang = "0.3"`, bvm-lang `2.0.0-alpha.3` |
+| A function value called with `(positional map, named map)` | Called with its arguments (`dcall`/`dcall_shape`; from the host, `Vm::run` with the parameters and the presence mask) |
+| Binding error: `TypeError` (E0100) at the function | `ArgumentError` (E0114) at the call |
+| `match` without a matching arm is `nil` | It raises `NoMatch` (E0200); add `_ => null` to keep `nil` |
+| `OpKind::Not` on an integer (bitwise) | `OpKind::BitNot` |
+| `CompileError::IntrinsicArity { expected, .. }` | `CompileError::IntrinsicArity { arity, found, .. }` |
+| Unknown named intrinsic: `Unsupported::Intrinsic` | `CompileError::UnknownIntrinsic { name, .. }` |
+| `Unsupported::Coroutine` | Removed: coroutines compile |
+| Mox operators as host calls | `Options::new().with_intrinsics(Intrinsics::mox())` and the host functions `docs/API.md` lists |
+
+---
+
 ## [0.2.0] - 2026-10-09
 
 The foundation: dynamic-profile compilation of resolved HIR (spec v2) to LSB
@@ -79,6 +213,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/bcgen-lang/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bcgen-lang/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/bcgen-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/bcgen-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/bcgen-lang/releases/tag/v0.1.0

@@ -5,7 +5,7 @@
 use alloc::vec::Vec;
 
 use bytecode_lang::{Const, Inst, IntOp, IntTy, Kind, Reg, ValType};
-use hir_lang::{BindMode, DefaultEval, Expr, ExprId, ItemKind, NodeRef, Pat};
+use hir_lang::{BindMode, Expr, ExprId, ItemKind, NodeRef, Pat};
 use intern_lang::Lookup;
 
 use super::{Dst, Gen, Rel, Step, Task, Val};
@@ -26,7 +26,6 @@ pub(crate) struct Params {
     pub(crate) regs: Vec<Reg>,
     pub(crate) mask: Option<Reg>,
     pub(crate) once: Vec<Option<Once>>,
-    pub(crate) per_call: bool,
 }
 
 /// Generates one queued function.
@@ -47,49 +46,50 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
             let mut g = Gen::new(cx, fx);
             g.at(node);
             let n = info.params.len();
-            let regs: Vec<Reg> = (0..n)
-                .map(|i| Reg(u16::try_from(i).unwrap_or(u16::MAX)))
-                .collect();
-            let mask = info
-                .has_mask
-                .then(|| Reg(u16::try_from(n).unwrap_or(u16::MAX)));
+            let regs: Vec<Reg> = (0..n).map(param_reg).collect();
+            let mask = info.has_mask.then(|| param_reg(n));
             let once = info.once.iter().map(|o| o.map(Once::Global)).collect();
             let params = Params {
                 list: info.params.clone(),
                 regs,
                 mask,
                 once,
-                per_call: def.defaults == DefaultEval::PerCall,
             };
             g.body(params, def.body, node)?;
             g.finish_fn()
         }
-        Job::DynEntry { item, f } => {
-            let node = NodeRef::Item(item);
-            let Some(info) = cx.fns.get(&item).cloned() else {
-                return Ok(());
-            };
-            let Some(body) = info.body else {
-                return Ok(());
-            };
-            let fx = FnCx::new(f, &[ValType::Dyn, ValType::Dyn], node);
+        Job::GenEntry {
+            f,
+            body,
+            caps,
+            sig,
+            node,
+        } => {
+            // `coro_new body, captures.., parameters..`: the coroutine is
+            // made now and runs at its first resume.
+            let fx = FnCx::new(f, &sig, node);
             let mut g = Gen::new(cx, fx);
             g.at(node);
-            let mut shape = alloc::vec![ValType::Dyn];
-            shape.extend_from_slice(&info.sig);
+            let mut shape: Vec<ValType> = Vec::with_capacity(1 + caps.len() + sig.len());
+            shape.push(ValType::Dyn);
+            shape.extend_from_slice(&caps);
+            shape.extend_from_slice(&sig);
             let win = g.fx.window(&shape);
-            let n = info.params.len();
-            let dests: Vec<Reg> = (0..n).map(|i| FnCx::slot(win.1, i + 1)).collect();
-            let mask = g.fx.temp(ValType::I64);
-            g.unpack(&info.params, Reg(0), Reg(1), &dests, mask);
-            if info.has_mask {
-                g.emit(Inst::Mov {
-                    dst: FnCx::slot(win.1, n + 1),
-                    src: mask,
+            for i in 0..caps.len() {
+                let idx = bytecode_lang::UpvalIdx(u16::try_from(i).unwrap_or(u16::MAX));
+                g.emit(Inst::GetUpval {
+                    dst: FnCx::slot(win.1, i + 1),
+                    idx,
                 });
             }
-            let argc = u8::try_from(info.sig.len()).unwrap_or(u8::MAX);
-            g.emit(Inst::Call {
+            for j in 0..sig.len() {
+                g.emit(Inst::Mov {
+                    dst: FnCx::slot(win.1, caps.len() + j + 1),
+                    src: param_reg(j),
+                });
+            }
+            let argc = u8::try_from(caps.len() + sig.len()).unwrap_or(u8::MAX);
+            g.emit(Inst::CoroNew {
                 dst: win.1,
                 func: body,
                 argc,
@@ -102,27 +102,44 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
             f,
             caps,
             aliases,
+            caps_in_params,
         } => {
             let node = NodeRef::Expr(e);
             let Expr::Closure(c) = *hir.expr(e) else {
                 return Ok(());
             };
-            let fx = FnCx::new(f, &[ValType::Dyn, ValType::Dyn], node);
-            let mut g = Gen::new(cx, fx);
-            g.at(node);
             let plist: Vec<PInfo> = hir
                 .list(c.params)
                 .iter()
                 .map(|&p| PInfo::of(hir, p))
                 .collect();
+            let has_mask = plist.iter().any(|p| p.default.is_some());
+            // The signature: (captures, for a generator's body), parameters,
+            // the presence mask.
+            let mut sig: Vec<ValType> = Vec::new();
+            if caps_in_params {
+                for cap in &caps {
+                    sig.push(match cap {
+                        Cap::Value(_) | Cap::Once(_) => ValType::Dyn,
+                        Cap::Cell(_) | Cap::SelfCell(_) => ValType::Ref(cx.types.cell),
+                    });
+                }
+            }
+            let off = sig.len();
+            sig.extend(plist.iter().map(|p| p.reg_type(&cx.types)));
+            if has_mask {
+                sig.push(ValType::I64);
+            }
+            let fx = FnCx::new(f, &sig, node);
+            let mut g = Gen::new(cx, fx);
+            g.at(node);
             let mut once: Vec<Option<Once>> = alloc::vec![None; plist.len()];
             let php = g.php();
             for (i, cap) in caps.iter().enumerate() {
-                let idx = bytecode_lang::UpvalIdx(u16::try_from(i).unwrap_or(u16::MAX));
                 match *cap {
                     Cap::Value(b) => {
                         let r = g.fx.temp(ValType::Dyn);
-                        g.emit(Inst::GetUpval { dst: r, idx });
+                        g.load_capture(r, i, caps_in_params);
                         // Each call starts from the captured value.
                         if php {
                             g.dup_into(r, r);
@@ -130,8 +147,7 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
                         if g.cx.is_cell(b) {
                             let ct = g.cell_ty();
                             let c = g.fx.temp(ct);
-                            let ty = g.cell_ref();
-                            g.emit(Inst::NewCell { dst: c, src: r, ty });
+                            g.emit(Inst::NewRef { dst: c, src: r });
                             g.fx.release(r);
                             g.cx.set_slot(b, Slot::Cell(c));
                         } else {
@@ -141,12 +157,12 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
                     Cap::Cell(b) | Cap::SelfCell(b) => {
                         let ct = g.cell_ty();
                         let c = g.fx.temp(ct);
-                        g.emit(Inst::GetUpval { dst: c, idx });
+                        g.load_capture(c, i, caps_in_params);
                         g.cx.set_slot(b, Slot::Cell(c));
                     }
                     Cap::Once(p) => {
                         let r = g.fx.temp(ValType::Dyn);
-                        g.emit(Inst::GetUpval { dst: r, idx });
+                        g.load_capture(r, i, caps_in_params);
                         if let Some(o) = once.get_mut(p) {
                             *o = Some(Once::Reg(r));
                         }
@@ -155,7 +171,7 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
             }
             for (b, slot) in aliases {
                 match slot {
-                    // The cell a shared global or static holds never
+                    // The reference a shared global or static holds never
                     // changes: load it once.
                     Slot::GlobalCell(gl) => {
                         let ct = g.cell_ty();
@@ -166,19 +182,14 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
                     _ => g.cx.set_slot(b, slot),
                 }
             }
-            let mut regs: Vec<Reg> = Vec::with_capacity(plist.len());
-            for p in &plist {
-                let ty = p.reg_type(&g.cx.types);
-                regs.push(g.fx.temp(ty));
-            }
-            let mask = g.fx.temp(ValType::I64);
-            g.unpack(&plist, Reg(0), Reg(1), &regs, mask);
+            let n = plist.len();
+            let regs: Vec<Reg> = (0..n).map(|j| param_reg(off + j)).collect();
+            let mask = has_mask.then(|| param_reg(off + n));
             let params = Params {
                 list: plist,
                 regs,
-                mask: Some(mask),
+                mask,
                 once,
-                per_call: c.defaults == DefaultEval::PerCall,
             };
             g.body(params, Some(c.body), node)?;
             g.finish_fn()
@@ -203,7 +214,6 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
                 regs: Vec::new(),
                 mask: None,
                 once: Vec::new(),
-                per_call: true,
             };
             g.body(params, body, root)?;
             g.finish_fn()
@@ -230,7 +240,26 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
     }
 }
 
+/// Parameter register `i` (parameters occupy the first registers).
+fn param_reg(i: usize) -> Reg {
+    Reg(u16::try_from(i).unwrap_or(u16::MAX))
+}
+
 impl<L: Lookup> Gen<'_, '_, L> {
+    /// Loads capture `i` into `dst`: an upvalue, or (for a generator
+    /// closure's coroutine body) the leading parameter `i`.
+    fn load_capture(&mut self, dst: Reg, i: usize, in_params: bool) {
+        if in_params {
+            self.emit(Inst::Mov {
+                dst,
+                src: param_reg(i),
+            });
+        } else {
+            let idx = bytecode_lang::UpvalIdx(u16::try_from(i).unwrap_or(u16::MAX));
+            self.emit(Inst::GetUpval { dst, idx });
+        }
+    }
+
     /// Adds the finished function to the module, with its origin table.
     fn finish_fn(self) -> Result<(), CompileError> {
         let Gen { cx, fx, .. } = self;
@@ -293,7 +322,6 @@ impl<L: Lookup> Gen<'_, '_, L> {
         };
         let mask = params.mask;
         let once = params.once.get(index).copied().flatten();
-        let per_call = params.per_call;
         let node = NodeRef::Param(p.id);
         self.at(node);
         let mut ts: Vec<Task> = Vec::new();
@@ -303,7 +331,6 @@ impl<L: Lookup> Gen<'_, '_, L> {
             self.test_bit(mask, index, b);
             self.jump_on(b, present, true);
             self.fx.release(b);
-            let _ = per_call;
             match once {
                 Some(o) => {
                     let t = self.fx.temp(ValType::Dyn);
@@ -315,12 +342,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                         self.dup_into(t, t);
                     }
                     if p.by_ref {
-                        let ty = self.cell_ref();
-                        self.emit(Inst::NewCell {
-                            dst: reg,
-                            src: t,
-                            ty,
-                        });
+                        self.emit(Inst::NewRef { dst: reg, src: t });
                     } else {
                         self.emit(Inst::Mov { dst: reg, src: t });
                     }
@@ -521,12 +543,11 @@ impl<L: Lookup> Gen<'_, '_, L> {
             src: k,
             to: bytecode_lang::Prim::F64,
         });
-        let sat =
-            bytecode_lang::Policy::new().with_float_to_int(bytecode_lang::FloatToInt::Saturate);
         self.emit(Inst::F64ToInt {
             dst: i,
             src: f,
-            op: IntOp::new(IntTy::I64).with_policy(sat),
+            conv: bytecode_lang::FloatConv::new(IntTy::I64)
+                .with_float_to_int(bytecode_lang::FloatToInt::Saturate),
         });
         self.emit(Inst::ToDyn {
             dst: r,

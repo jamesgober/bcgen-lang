@@ -1,5 +1,5 @@
 //! One walk over the unit before code generation: which items exist, which
-//! variables must live in cells, and what each closure captures.
+//! variables must live in LSB references, and what each closure captures.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
@@ -14,7 +14,7 @@ use hir_lang::{
 pub(crate) struct Analysis {
     /// Per binder: the variable is shared (captured by reference, aliased by
     /// a reference assignment, passed by reference, or a by-reference
-    /// parameter), so it lives in a cell.
+    /// parameter), so it lives in an LSB reference.
     pub(crate) cell: Vec<bool>,
     /// Per closure: the outer value binders it uses (implicit captures,
     /// transitively through nested closures), in first-use order.
@@ -32,12 +32,12 @@ pub(crate) struct Analysis {
     pub(crate) module_bodies: Vec<ItemId>,
     /// The first item kind with code this release does not compile.
     pub(crate) unsupported_item: Option<ItemId>,
-    /// Some argument is passed as a place, so by-value parameters of
-    /// dynamically called functions must unwrap cells.
-    pub(crate) place_args: bool,
     /// Global items shared by reference (through a `global` alias, a place
-    /// argument, or a reference assignment): their storage is a cell.
+    /// argument, or a reference assignment): their storage is a reference.
     pub(crate) cell_globals: BTreeSet<ItemId>,
+    /// `let_place` aliases: the place each `Place` binder names, so marking
+    /// an alias as shared marks the variable behind it.
+    places: BTreeMap<BinderId, ExprId>,
 }
 
 impl Analysis {
@@ -50,8 +50,8 @@ impl Analysis {
             module_bodies: Vec::new(),
             inits: Vec::new(),
             unsupported_item: None,
-            place_args: false,
             cell_globals: BTreeSet::new(),
+            places: BTreeMap::new(),
         };
         let mut aliases: Vec<(BinderId, hir_lang::PathId)> = Vec::new();
         let mut by_ref_closures: BTreeSet<ExprId> = BTreeSet::new();
@@ -119,11 +119,27 @@ impl Analysis {
         }
     }
 
+    /// Marks the variable a place names (when it is a variable) as shared:
+    /// through `let_place` aliases to the variable behind them (bounded by
+    /// the number of aliases, so a malformed cycle cannot loop).
     fn mark_path_local(&mut self, hir: &Hir, e: ExprId) {
-        if let Expr::Path(p) = *hir.expr(e) {
+        let mut e = e;
+        for _ in 0..=self.places.len() {
+            let Expr::Path(p) = *hir.expr(e) else {
+                return;
+            };
             match hir.path(p).res {
-                Res::Local(b) => self.mark(b),
-                res => self.mark_global(hir, res),
+                Res::Local(b) => match self.places.get(&b) {
+                    Some(&place) => e = place,
+                    None => {
+                        self.mark(b);
+                        return;
+                    }
+                },
+                res => {
+                    self.mark_global(hir, res);
+                    return;
+                }
             }
         }
     }
@@ -176,6 +192,9 @@ impl Analysis {
                     let _ = by_ref_closures.insert(id);
                 }
             }
+            Expr::LetPlace { binder, place, .. } => {
+                let _ = self.places.insert(binder, place);
+            }
             Expr::RefAssign { target, source } => {
                 self.mark_path_local(hir, target);
                 self.mark_path_local(hir, source);
@@ -185,11 +204,11 @@ impl Analysis {
             | Expr::DynMethodCall { args, .. } => {
                 for arg in hir.list(args) {
                     if arg.place {
-                        self.place_args = true;
                         self.mark_path_local(hir, arg.value);
                     }
                 }
             }
+
             _ => {}
         }
     }

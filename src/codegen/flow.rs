@@ -146,11 +146,10 @@ impl<L: Lookup> Gen<'_, '_, L> {
                         (Slot::Cell(c), None) => {
                             let n = self.fx.temp(ValType::Dyn);
                             self.emit(Inst::LoadNil { dst: n });
-                            let ty = self.cell_ref();
-                            self.emit(Inst::NewCell { dst: c, src: n, ty });
+                            self.emit(Inst::NewRef { dst: c, src: n });
                             self.fx.release(n);
                         }
-                        (Slot::Global(_) | Slot::GlobalCell(_), _) => {}
+                        (Slot::Global(_) | Slot::GlobalCell(_) | Slot::Place(_), _) => {}
                     }
                 }
                 Pat::Wild => {
@@ -599,11 +598,14 @@ impl<L: Lookup> Gen<'_, '_, L> {
             ts.push(Task::Bind(next));
             ts.push(Task::ScopeClose);
         }
-        // No arm matched: the match is nil.
+        // No arm matched: `NoMatch` (E0200) with the scrutinee as payload
+        // (HIR §8.10).
         ts.push(Task::At(node));
-        if let Some(r) = result {
-            ts.push(Task::Emit(Inst::LoadNil { dst: r }));
-        }
+        ts.push(Task::Push(Val {
+            reg: s.reg,
+            rel: Rel::Keep,
+        }));
+        ts.push(Task::Step(Step::RaiseNoMatch));
         ts.push(Task::Bind(end));
         ts.push(Task::Push(s));
         ts.push(Task::Deliver {

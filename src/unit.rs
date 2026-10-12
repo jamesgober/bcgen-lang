@@ -1,15 +1,15 @@
 //! The module-level driver: declares every function, global, and import of
 //! the unit, then generates function bodies from a work queue (closures and
-//! dynamic entries are discovered while generating and queued, never
+//! generator entries are discovered while generating and queued, never
 //! generated recursively).
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use bytecode_lang::{
     Callee, Const, ExportItem, FuncId, FunctionBuilder, GlobalId, Hook, ImportId, ModuleBuilder,
-    StrId, TypeDef, TypeId, ValType,
+    Param as LParam, ParamKind as LParamKind, ParamList, StrId, TypeDef, TypeId, ValType,
 };
 use hir_lang::{
     BinderId, Def, DefaultEval, Effects, Expr, ExprId, Hir, ItemId, ItemKind, Lit, NodeRef,
@@ -22,17 +22,22 @@ use crate::error::{CompileError, Unsupported};
 use crate::options::{BodyMode, Locate, Options};
 use crate::output::Compiled;
 
-/// The most parameters a function may have: the width of the presence mask.
-pub(crate) const MAX_PARAMS: usize = 64;
+/// The most parameters a function may have when one has a default: the
+/// width of the presence mask (LSB §5.15).
+pub(crate) const MAX_PARAMS_WITH_DEFAULTS: usize = 64;
+
+/// The most signature parameters (and call-window arguments) LSB carries.
+pub(crate) const MAX_ARITY: usize = 255;
 
 /// The module-wide types every function uses.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Types {
-    /// `map dyn -> dyn`: arrays, maps, records, argument packets.
+    /// `map dyn -> dyn`: arrays, maps, records.
     pub(crate) map: TypeId,
-    /// `cell dyn`: shared variables.
+    /// `cell dyn`: the register type of references (shared variables,
+    /// by-reference parameters; LSB §5.17).
     pub(crate) cell: TypeId,
-    /// `iter dyn -> dyn`: typed iteration over packets.
+    /// `iter dyn -> dyn`: typed iteration over maps.
     pub(crate) iter: TypeId,
 }
 
@@ -41,14 +46,16 @@ pub(crate) struct Types {
 pub(crate) enum Slot {
     /// In a `dyn` register.
     Reg(bytecode_lang::Reg),
-    /// In a cell, held by a `ref cell` register.
+    /// In a reference (LSB §5.17), held by a `ref cell` register.
     Cell(bytecode_lang::Reg),
     /// In a module global (`global $x`, `static $x`, a global captured by
     /// reference).
     Global(GlobalId),
-    /// In a cell held by a module global: a global or static shared by
+    /// In a reference held by a module global: a global or static shared by
     /// reference.
     GlobalCell(GlobalId),
+    /// A `let_place` alias: an index into the function's evaluated places.
+    Place(u32),
 }
 
 /// A parameter, as the calling convention sees it.
@@ -91,14 +98,21 @@ impl PInfo {
         matches!(self.kind, ParamKind::Normal | ParamKind::NamedOnly) && self.name.is_some()
     }
 
-    /// Must be supplied: no default, not a rest parameter.
-    pub(crate) fn required(&self) -> bool {
-        self.default.is_none() && !matches!(self.kind, ParamKind::Rest | ParamKind::RestNamed)
+    /// A rest parameter (positional or named).
+    pub(crate) fn rest(&self) -> bool {
+        matches!(self.kind, ParamKind::Rest | ParamKind::RestNamed)
     }
 
-    /// The register type of the parameter in a direct-call frame.
+    /// Must be supplied: no default, not a rest parameter.
+    pub(crate) fn required(&self) -> bool {
+        self.default.is_none() && !self.rest()
+    }
+
+    /// The register type of the parameter: a by-reference parameter
+    /// receives a reference (a by-reference rest parameter, a collection of
+    /// them).
     pub(crate) fn reg_type(&self, types: &Types) -> ValType {
-        if self.by_ref {
+        if self.by_ref && !self.rest() {
             ValType::Ref(types.cell)
         } else {
             ValType::Dyn
@@ -109,12 +123,14 @@ impl PInfo {
 /// A function item.
 #[derive(Clone, Debug)]
 pub(crate) struct FnInfo {
-    /// The direct-call function, or `None` for a bodyless (host) function.
-    pub(crate) body: Option<FuncId>,
-    /// The dynamic entry (argument packet), created when first needed.
-    pub(crate) dyn_entry: Option<FuncId>,
+    /// The function every call reaches: it carries the parameter list (a
+    /// generator's makes the coroutine). `None` for a bodyless (host)
+    /// function.
+    pub(crate) callable: Option<FuncId>,
+    /// A generator's coroutine body (same signature as the callable).
+    pub(crate) gen_body: Option<FuncId>,
     pub(crate) params: Vec<PInfo>,
-    /// The direct-call signature: parameters, then the presence mask.
+    /// The signature: parameters, then the presence mask.
     pub(crate) sig: Vec<ValType>,
     pub(crate) has_mask: bool,
     /// Per parameter, the global holding a default evaluated once.
@@ -127,9 +143,9 @@ pub(crate) struct FnInfo {
 pub(crate) enum Cap {
     /// The value of a variable at creation.
     Value(BinderId),
-    /// The cell of a shared variable.
+    /// The reference of a shared variable.
     Cell(BinderId),
-    /// The cell that will hold the closure itself (its self binder).
+    /// The reference that will hold the closure itself (its self binder).
     SelfCell(BinderId),
     /// The default of parameter `n`, evaluated once at creation.
     Once(usize),
@@ -137,13 +153,21 @@ pub(crate) enum Cap {
 
 /// A function body waiting to be generated.
 pub(crate) enum Job {
+    /// A function item's code (a generator's coroutine body).
     Body {
         item: ItemId,
         f: FunctionBuilder,
     },
-    DynEntry {
-        item: ItemId,
+    /// A generator's callable: makes the coroutine of `body` from its
+    /// captures (passed as leading arguments) and parameters.
+    GenEntry {
         f: FunctionBuilder,
+        body: FuncId,
+        /// The capture types, read with `get_upval`.
+        caps: Vec<ValType>,
+        /// The signature.
+        sig: Vec<ValType>,
+        node: NodeRef,
     },
     Closure {
         e: ExprId,
@@ -151,6 +175,9 @@ pub(crate) enum Job {
         caps: Vec<Cap>,
         /// Captured variables that alias globals (no upvalue).
         aliases: Vec<(BinderId, Slot)>,
+        /// A generator closure's body: its captures arrive as the leading
+        /// parameters, not as upvalues.
+        caps_in_params: bool,
     },
     Start {
         f: FunctionBuilder,
@@ -311,24 +338,42 @@ impl<L: Lookup> Cx<'_, L> {
         id
     }
 
-    /// The dynamic entry of a function item, declared on first use.
-    pub(crate) fn dyn_entry(&mut self, item: ItemId) -> Option<FuncId> {
-        let info = self.fns.get(&item)?;
-        if let Some(d) = info.dyn_entry {
-            return Some(d);
+    /// The LSB parameter list of a HIR parameter list (LSB §5.15): HIR's
+    /// `rest` collects into a map (`rest_map`, PHP 8.1's `...$args`: extra
+    /// positional arguments under `0, 1, ...`, and unknown named ones when
+    /// there is no `rest_named`). A `normal` or `named_only` parameter whose
+    /// pattern binds no single name (or repeats an earlier name) gets a
+    /// name no source argument can spell, so it binds by position only.
+    pub(crate) fn param_list(&mut self, params: &[PInfo]) -> ParamList {
+        let mut used: BTreeSet<Symbol> = BTreeSet::new();
+        let mut out: Vec<LParam> = Vec::with_capacity(params.len());
+        for (i, p) in params.iter().enumerate() {
+            let kind = match p.kind {
+                ParamKind::Receiver | ParamKind::PositionalOnly => LParamKind::PositionalOnly,
+                ParamKind::Normal => LParamKind::Normal,
+                ParamKind::NamedOnly => LParamKind::NamedOnly,
+                ParamKind::Rest => LParamKind::RestMap,
+                ParamKind::RestNamed => LParamKind::RestNamed,
+            };
+            let name = if kind.takes_names() {
+                let text = match p.name {
+                    Some(s) if used.insert(s) => self.text(s),
+                    _ => alloc::format!("\0#{i}"),
+                };
+                Some(self.mb.string(&text))
+            } else {
+                None
+            };
+            let mut lp = LParam::new(kind, name);
+            if p.by_ref {
+                lp = lp.by_ref();
+            }
+            if p.default.is_some() && !p.rest() {
+                lp = lp.with_default();
+            }
+            out.push(lp);
         }
-        let _body = info.body?;
-        let mut name = info.name.clone();
-        name.push_str("$dyn");
-        let f = self
-            .mb
-            .function(&name, &[ValType::Dyn, ValType::Dyn], &[ValType::Dyn]);
-        let id = f.id();
-        if let Some(info) = self.fns.get_mut(&item) {
-            info.dyn_entry = Some(id);
-        }
-        self.jobs.push_back(Job::DynEntry { item, f });
-        Some(id)
+        ParamList::new(out)
     }
 
     /// The constant a literal loads, or `None` for `null` (the default of a
@@ -361,6 +406,39 @@ impl<L: Lookup> Cx<'_, L> {
     }
 }
 
+/// Checks a parameter list against LSB's limits (64 parameters when one has
+/// a default; 255 signature entries, `extra` leading ones included).
+pub(crate) fn check_params(
+    params: &[PInfo],
+    extra: usize,
+    node: NodeRef,
+    span: Span,
+) -> Result<(), CompileError> {
+    let has_mask = params.iter().any(|p| p.default.is_some());
+    let limit = if has_mask {
+        MAX_PARAMS_WITH_DEFAULTS
+    } else {
+        MAX_ARITY
+    };
+    let total = params.len() + usize::from(has_mask) + extra;
+    if params.len() > limit || total > MAX_ARITY {
+        return Err(CompileError::TooManyParams {
+            node,
+            span,
+            limit: u32::try_from(limit.min(MAX_ARITY.saturating_sub(extra))).unwrap_or(0),
+        });
+    }
+    Ok(())
+}
+
+/// Whether a function or closure with these effects is a generator: its
+/// calls make coroutines (LSB §5.13). `ASYNC` alone is not: coroutines are
+/// stackful, so an async function runs on its caller's task and its `await`s
+/// suspend that task.
+pub(crate) fn is_generator(effects: Effects) -> bool {
+    effects.contains(Effects::YIELD)
+}
+
 /// The `i64` an integer literal denotes, if it has one.
 pub(crate) fn int_value(i: hir_lang::IntLit) -> Option<i64> {
     if i.negative {
@@ -378,8 +456,15 @@ pub(crate) fn int_value(i: hir_lang::IntLit) -> Option<i64> {
 /// returns a value.
 fn hook_shape(h: Hook) -> (usize, bool) {
     match h {
-        Hook::Neg | Hook::BitNot | Hook::Truthy | Hook::Iter | Hook::Len | Hook::Spawn => (1, true),
+        Hook::Neg
+        | Hook::BitNot
+        | Hook::Truthy
+        | Hook::Iter
+        | Hook::Len
+        | Hook::Spawn
+        | Hook::Abs => (1, true),
         Hook::SetIndex | Hook::SetProp => (3, false),
+        Hook::CallShape => (3, true),
         _ => (2, true),
     }
 }
@@ -489,16 +574,16 @@ pub(crate) fn compile<L: Lookup>(
     }
     cx.mb.export("<entry>", ExportItem::Func(entry));
     // Root-level functions, under their names (the first of a name wins).
-    let mut exported: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    let mut exported: BTreeSet<String> = BTreeSet::new();
     if let ItemKind::Module { items, .. } = hir.item(root).kind {
         for &item in hir.list(items) {
             if let Some(info) = cx.fns.get(&item) {
-                if let Some(body) = info.body {
+                if let Some(callable) = info.callable {
                     if !info.name.is_empty()
                         && !exported.contains(&info.name)
                         && info.name != "<entry>"
                     {
-                        cx.mb.export(&info.name, ExportItem::Func(body));
+                        cx.mb.export(&info.name, ExportItem::Func(callable));
                         let _ = exported.insert(info.name.clone());
                     }
                 }
@@ -508,7 +593,7 @@ pub(crate) fn compile<L: Lookup>(
     let functions: Vec<(ItemId, FuncId)> = cx
         .fns
         .iter()
-        .filter_map(|(&item, info)| info.body.map(|b| (item, b)))
+        .filter_map(|(&item, info)| info.callable.map(|b| (item, b)))
         .collect();
     let module = cx.mb.finish()?;
     let count = module.functions().len();
@@ -527,8 +612,9 @@ pub(crate) fn compile<L: Lookup>(
     })
 }
 
-/// Declares every function item's direct-call function (so calls may refer
-/// to any function, in any order) and its once-evaluated default globals.
+/// Declares every function item's callable (so calls may refer to any
+/// function, in any order), a generator's coroutine body, and the
+/// once-evaluated default globals.
 fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> {
     let fns = cx.an.fns.clone();
     for item in fns {
@@ -537,9 +623,6 @@ fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> 
         let ItemKind::Fn(def) = it.kind else {
             continue;
         };
-        if def.effects.contains(Effects::ASYNC) || def.effects.contains(Effects::YIELD) {
-            return Err(cx.unsupported(Unsupported::Coroutine, node));
-        }
         let params: Vec<PInfo> = cx
             .hir
             .list(def.params)
@@ -549,13 +632,7 @@ fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> 
         if params.iter().any(|p| p.kind == ParamKind::Receiver) {
             return Err(cx.unsupported(Unsupported::Class, node));
         }
-        if params.len() > MAX_PARAMS {
-            return Err(CompileError::TooManyParams {
-                node,
-                span: cx.span(node),
-                limit: MAX_PARAMS as u32,
-            });
-        }
+        check_params(&params, 0, node, cx.span(node))?;
         let name = it.name.map(|n| cx.text(n.sym)).unwrap_or_default();
         let has_mask = params.iter().any(|p| p.default.is_some());
         let mut sig: Vec<ValType> = params.iter().map(|p| p.reg_type(&cx.types)).collect();
@@ -563,7 +640,7 @@ fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> 
             sig.push(ValType::I64);
         }
         let mut once = alloc::vec![None; params.len()];
-        let body = if def.body.is_some() {
+        let (callable, gen_body) = if def.body.is_some() {
             if def.defaults == DefaultEval::Once {
                 for (i, p) in params.iter().enumerate() {
                     if p.default.is_some() {
@@ -576,22 +653,40 @@ fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> 
                 }
             }
             let fname = if name.is_empty() {
-                "<fn>"
+                String::from("<fn>")
             } else {
-                name.as_str()
+                name.clone()
             };
-            let f = cx.mb.function(fname, &sig, &[ValType::Dyn]);
+            let list = cx.param_list(&params);
+            let mut f = cx.mb.function(&fname, &sig, &[ValType::Dyn]);
+            f.set_params(list);
             let id = f.id();
-            cx.jobs.push_back(Job::Body { item, f });
-            Some(id)
+            if is_generator(def.effects) {
+                let mut gname = fname;
+                gname.push_str("$gen");
+                let g = cx.mb.function(&gname, &sig, &[ValType::Dyn]);
+                let gid = g.id();
+                cx.jobs.push_back(Job::Body { item, f: g });
+                cx.jobs.push_back(Job::GenEntry {
+                    f,
+                    body: gid,
+                    caps: Vec::new(),
+                    sig: sig.clone(),
+                    node,
+                });
+                (Some(id), Some(gid))
+            } else {
+                cx.jobs.push_back(Job::Body { item, f });
+                (Some(id), None)
+            }
         } else {
-            None
+            (None, None)
         };
         let _ = cx.fns.insert(
             item,
             FnInfo {
-                body,
-                dyn_entry: None,
+                callable,
+                gen_body,
                 params,
                 sig,
                 has_mask,
@@ -622,7 +717,7 @@ fn declare_globals<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<bool, CompileError> 
             _ => None,
         });
         let g = match (init, lit) {
-            // Shared by reference: the start function puts a cell here.
+            // Shared by reference: the start function puts a reference here.
             _ if cx.an.cell_globals.contains(&item) => {
                 code = true;
                 cx.mb.global(&name, ValType::Dyn, true, None)

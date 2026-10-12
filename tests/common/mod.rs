@@ -205,7 +205,7 @@ pub fn run_compiled(out: &Compiled, fuel: u64) -> (Outcome, Vec<String>) {
     };
     let outcome = match r {
         Ok(v) => Outcome::Value(to_rv(&vm, v, 0)),
-        Err(VmError::Raised { kind, func, pc }) => match kind {
+        Err(VmError::Raised { kind, func, pc, .. }) => match kind {
             ErrorKind::StackOverflow => Outcome::Budget,
             _ => Outcome::Raised {
                 code: kind.code(),

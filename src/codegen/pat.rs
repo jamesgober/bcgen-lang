@@ -8,7 +8,7 @@
 //! numbers, chars with chars) and order, and a type test by dynamic kind.
 
 use bytecode_lang::{Inst, IntOp, IntTy, Kind, Label, Reg, ValType};
-use hir_lang::{BindMode, ItemKind, Lit, NodeRef, Pat, PatId, Prim, Res, Ty, TyId};
+use hir_lang::{BindMode, ItemKind, Lit, NodeRef, Pat, PatId, Res, TyId};
 use intern_lang::Lookup;
 
 use super::{Gen, Task};
@@ -42,7 +42,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 match self.const_value(res, NodeRef::Path(path))? {
                     Some(g) => {
                         let t = self.fx.temp(ValType::Dyn);
-                        self.read_slot(g, t);
+                        self.read_var(g, t);
                         self.eq_or_fail(v, t, fail);
                         self.fx.release(t);
                     }
@@ -61,7 +61,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 match self.const_value(res, pnode)? {
                     Some(g) => {
                         let t = self.fx.temp(ValType::Dyn);
-                        self.read_slot(g, t);
+                        self.read_var(g, t);
                         self.eq_or_fail(v, t, fail);
                         self.fx.release(t);
                     }
@@ -397,7 +397,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 }
                 Pat::Path(path) => {
                     match self.const_value(hir.path(path).res, NodeRef::Path(path))? {
-                        Some(g) => self.read_slot(g, t),
+                        Some(g) => self.read_var(g, t),
                         None => return Err(self.cx.unsupported(Unsupported::Pattern, pnode)),
                     }
                 }
@@ -494,7 +494,9 @@ impl<L: Lookup> Gen<'_, '_, L> {
         Ok(())
     }
 
-    /// The dynamic kinds a type stands for, as a test on `v`.
+    /// The dynamic kinds a type stands for, as a test on `v`: a union
+    /// matches a value of any member's kinds, an intersection one of every
+    /// member's (see [`kind_set`](super::ops::kind_set)).
     fn type_test(
         &mut self,
         v: Reg,
@@ -502,52 +504,16 @@ impl<L: Lookup> Gen<'_, '_, L> {
         fail: Label,
         node: NodeRef,
     ) -> Result<(), CompileError> {
-        let hir = self.cx.hir;
-        let (ty, nullable) = match *hir.ty(ty) {
-            Ty::Nullable(inner) => (inner, true),
-            _ => (ty, false),
+        let Some(kinds) = super::ops::kind_set(self.cx.hir, ty) else {
+            return Err(self.cx.unsupported(Unsupported::Pattern, node));
         };
-        let kinds: &[Kind] = match *hir.ty(ty) {
-            Ty::Any | Ty::Infer => return Ok(()),
-            Ty::Tuple(_) | Ty::Array { .. } | Ty::Slice(_) => &[Kind::Map],
-            Ty::Prim(p) => prim_kinds(p),
-            Ty::Path(p) => match hir.path(p).res {
-                Res::Prim(p) => prim_kinds(p),
-                _ => return Err(self.cx.unsupported(Unsupported::Pattern, node)),
-            },
-            _ => return Err(self.cx.unsupported(Unsupported::Pattern, node)),
-        };
+        if kinds == super::ops::ALL_KINDS {
+            return Ok(());
+        }
         let ok = self.label();
-        let b = self.fx.temp(ValType::Bool);
-        if nullable {
-            self.emit(Inst::IsKind {
-                dst: b,
-                src: v,
-                kind: Kind::Nil,
-            });
-            self.jump_on(b, ok, true);
-        }
-        for &k in kinds {
-            self.emit(Inst::IsKind {
-                dst: b,
-                src: v,
-                kind: k,
-            });
-            self.jump_on(b, ok, true);
-        }
+        self.test_kinds(v, kinds, ok);
         self.jmp(fail);
         self.bind(ok);
-        self.fx.release(b);
         Ok(())
-    }
-}
-
-fn prim_kinds(p: Prim) -> &'static [Kind] {
-    match p {
-        Prim::Bool => &[Kind::Bool],
-        Prim::F32 | Prim::F64 => &[Kind::Float],
-        Prim::Char => &[Kind::Char],
-        Prim::Str => &[Kind::Str],
-        _ => &[Kind::Int],
     }
 }
