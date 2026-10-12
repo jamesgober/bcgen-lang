@@ -11,6 +11,11 @@
 //! everywhere else. Fast paths never invoke an LSB hook, so their results do
 //! not depend on which hooks a module binds.
 //!
+//! A fourth kind, a **class operation** ([`ClassOp`]: `new`, `instanceof`,
+//! `clone`), compiles inline against the unit's own classes and falls back
+//! to the host function for anything else (a class name only known at run
+//! time that the unit does not declare, a non-object clone).
+//!
 //! [`Intrinsics::mox`] maps every intrinsic of the Mox sketch; `docs/API.md`
 //! states each mapping and the exact semantics its host function must have.
 
@@ -286,7 +291,11 @@ pub enum Fast {
     NumIdentity,
     /// Domain: an `int`. Result: its bitwise complement.
     IntBitNot,
-    /// Domain: `int` (itself), `bool` (0 or 1), `nil` (0). An `int`.
+    /// Domain: `int` (itself), `bool` (0 or 1), `nil` (0), and `float` by
+    /// PHP 7/8's `zend_dval_to_lval` on 64-bit platforms: truncated toward
+    /// zero when in `[-2^63, 2^63)`, NaN and infinities 0, and any other
+    /// finite value taken modulo 2^64 into the signed range (`1e19` is
+    /// `-8446744073709551616`, `-1e19` is `8446744073709551616`). An `int`.
     ToInt,
     /// Domain: `float` (itself), `int` (the nearest `float`, ties to even),
     /// `bool` (0.0 or 1.0), `nil` (0.0). A `float`.
@@ -298,6 +307,12 @@ pub enum Fast {
     ToBool,
     /// Domain: `map`. Result: the operand.
     ToArray,
+    /// Domain: a `str` and an `int` offset `i` with `-len <= i < len`.
+    /// Result: the one-byte string at `i` (counted from the end when
+    /// negative), PHP 7.1+'s `$s[i]`. Out-of-range offsets and every other
+    /// operand kind go to the host function (PHP: a warning and `""`, or a
+    /// `TypeError` for an offset that is not an integer).
+    StrOffset,
 }
 
 impl Fast {
@@ -312,6 +327,7 @@ impl Fast {
     pub const fn arity(self) -> Arity {
         match self {
             Self::ConcatN => Arity::at_least(0),
+            Self::StrOffset => Arity::exact(2),
             Self::NumIdentity
             | Self::IntBitNot
             | Self::ToInt
@@ -320,6 +336,65 @@ impl Fast {
             | Self::ToBool
             | Self::ToArray => Arity::exact(1),
             _ => Arity::exact(2),
+        }
+    }
+}
+
+/// A class operation: compiled inline against the classes the unit
+/// declares, with a host function for whatever the unit does not declare.
+///
+/// # Examples
+///
+/// ```
+/// use bcgen_lang::{Arity, ClassOp};
+///
+/// assert_eq!(ClassOp::InstanceOf.arity(), Arity::range(1, 2));
+/// assert_eq!(ClassOp::New.arity(), Arity::at_least(0));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClassOp {
+    /// `new C(args)`: the class is the intrinsic's type argument
+    /// (`mox.new<C>(args)`), else operand 1, and the rest are the
+    /// constructor's arguments (spread and named ones included, through an
+    /// extern call). A class of the unit (a path, `C::class`,
+    /// `self::class`, `parent::class`) is instantiated inline: a new struct,
+    /// its property defaults, then the constructor, with the arguments
+    /// bound by the constructor's parameter list. `static::class` and a
+    /// class value only known at run time (a string name, an object) are
+    /// looked up among the unit's classes at run time; a name the unit does
+    /// not declare goes to the host function with the name and the
+    /// arguments (positional only).
+    New,
+    /// `x instanceof C`: the class or interface is the type argument
+    /// (`mox.instanceof<I>(x)`, the only way HIR can name an interface in
+    /// an expression), else operand 2. Inline for the unit's classes
+    /// (`is_type`) and interfaces (a marker method); a class value only
+    /// known at run time is looked up the same way; anything else goes to
+    /// the host function.
+    InstanceOf,
+    /// `clone x`: an instance of a unit class is copied (`dup`, a new
+    /// identity; array properties copy on write) and the clone method
+    /// ([`Options::clone_method`](crate::Options::clone_method)) is called
+    /// on the copy when its class has one; every other value goes to the
+    /// host function.
+    Clone,
+}
+
+impl ClassOp {
+    /// The operands the operation takes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bcgen_lang::ClassOp::Clone.arity().max(), 1);
+    /// ```
+    #[must_use]
+    pub const fn arity(self) -> Arity {
+        match self {
+            Self::New => Arity::at_least(0),
+            Self::InstanceOf => Arity::range(1, 2),
+            Self::Clone => Arity::exact(1),
         }
     }
 }
@@ -357,6 +432,18 @@ pub enum Lowering {
         /// The function name of the slow path.
         name: String,
     },
+    /// A class operation, inline for the unit's classes, the host function
+    /// `module`.`name` for everything else. A call of the extern path of
+    /// the same name compiles the same way (lowering templates call host
+    /// symbols, not intrinsics).
+    Class {
+        /// The operation.
+        op: ClassOp,
+        /// The import module of the fallback.
+        module: String,
+        /// The function name of the fallback.
+        name: String,
+    },
 }
 
 impl Lowering {
@@ -373,9 +460,9 @@ impl Lowering {
     pub fn host(&self) -> Option<(&str, &str)> {
         match self {
             Self::Lsb(_) => None,
-            Self::Host { module, name } | Self::Fast { module, name, .. } => {
-                Some((module.as_str(), name.as_str()))
-            }
+            Self::Host { module, name }
+            | Self::Fast { module, name, .. }
+            | Self::Class { module, name, .. } => Some((module.as_str(), name.as_str())),
         }
     }
 }
@@ -497,10 +584,14 @@ impl Intrinsics {
 
     /// [`core`](Intrinsics::core) plus every intrinsic of the Mox sketch
     /// (`_lexersketch/sketches/mox.lsf`), each a [`Fast`] path over the host
-    /// function `mox`.`<name>` where one is exact, else the host function
-    /// alone (`mox.instanceof`, `mox.cast_object`, `mox.clone`). The table
-    /// in `docs/API.md` gives every mapping and the semantics its host
-    /// function must implement.
+    /// function `mox`.`<name>` where one is exact, a [`ClassOp`] over it for
+    /// `mox.instanceof` and `mox.clone`, else the host function alone
+    /// (`mox.cast_object`); plus `mox.new` (the sketch's `new_object`
+    /// template calls the extern `mox.new`) as [`ClassOp::New`], and
+    /// `mox.str_offset` ([`Fast::StrOffset`]) for
+    /// [`Options::with_string_offsets`](crate::Options::with_string_offsets).
+    /// The table in `docs/API.md` gives every mapping and the semantics its
+    /// host function must implement.
     ///
     /// # Examples
     ///
@@ -512,11 +603,12 @@ impl Intrinsics {
     ///     t.get("mox.loose_eq").unwrap().lowering(),
     ///     Lowering::Fast { fast: Fast::LooseEq, .. }
     /// ));
-    /// assert!(matches!(t.get("mox.clone").unwrap().lowering(), Lowering::Host { .. }));
+    /// assert!(matches!(t.get("mox.clone").unwrap().lowering(), Lowering::Class { .. }));
+    /// assert!(matches!(t.get("mox.cast_object").unwrap().lowering(), Lowering::Host { .. }));
     /// ```
     #[must_use]
     pub fn mox() -> Self {
-        const FAST: [(&str, Fast); 23] = [
+        const FAST: [(&str, Fast); 24] = [
             ("concat", Fast::Concat),
             ("concat_n", Fast::ConcatN),
             ("mod", Fast::IntRem),
@@ -540,20 +632,25 @@ impl Intrinsics {
             ("cast_string", Fast::ToStr),
             ("cast_bool", Fast::ToBool),
             ("cast_array", Fast::ToArray),
+            ("str_offset", Fast::StrOffset),
         ];
-        const HOST: [(&str, u8); 3] = [("instanceof", 2), ("cast_object", 1), ("clone", 1)];
+        const CLASS: [(&str, ClassOp); 3] = [
+            ("new", ClassOp::New),
+            ("instanceof", ClassOp::InstanceOf),
+            ("clone", ClassOp::Clone),
+        ];
         let mut t = Intrinsics::core();
         for (name, fast) in FAST {
             let mut full = String::from("mox.");
             full.push_str(name);
             t = t.with_fast(&full, fast, "mox", name);
         }
-        for (name, n) in HOST {
+        for (name, op) in CLASS {
             let mut full = String::from("mox.");
             full.push_str(name);
-            t = t.with_host(&full, Arity::exact(n), "mox", name);
+            t = t.with_class(&full, op, "mox", name);
         }
-        t
+        t.with_host("mox.cast_object", Arity::exact(1), "mox", "cast_object")
     }
 
     /// Registers `name` as the LSB sequence `op` (its arity is the op's),
@@ -626,6 +723,32 @@ impl Intrinsics {
         self
     }
 
+    /// Registers `name` as the class operation `op` (its arity is the
+    /// operation's) over the host function `module`.`func`, replacing any
+    /// earlier entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bcgen_lang::{ClassOp, Intrinsics, Lowering};
+    ///
+    /// let t = Intrinsics::new().with_class("rt.new", ClassOp::New, "rt", "new");
+    /// assert!(matches!(t.get("rt.new").unwrap().lowering(), Lowering::Class { op: ClassOp::New, .. }));
+    /// ```
+    #[must_use]
+    pub fn with_class(mut self, name: &str, op: ClassOp, module: &str, func: &str) -> Self {
+        let def = IntrinsicDef {
+            arity: op.arity(),
+            lowering: Lowering::Class {
+                op,
+                module: String::from(module),
+                name: String::from(func),
+            },
+        };
+        let _previous = self.table.insert(String::from(name), def);
+        self
+    }
+
     /// The entry for `name`.
     ///
     /// # Examples
@@ -643,7 +766,7 @@ impl Intrinsics {
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(bcgen_lang::Intrinsics::mox().len(), 41);
+    /// assert_eq!(bcgen_lang::Intrinsics::mox().len(), 43);
     /// ```
     #[must_use]
     pub fn len(&self) -> usize {
@@ -712,6 +835,8 @@ mod tests {
             "cast_array",
             "cast_object",
             "clone",
+            "new",
+            "str_offset",
         ] {
             let full = alloc::format!("mox.{name}");
             let def = t.get(&full).unwrap_or_else(|| panic!("{full} missing"));

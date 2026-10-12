@@ -18,6 +18,7 @@ use hir_lang::{
 use intern_lang::Lookup;
 
 use crate::analysis::Analysis;
+use crate::class::{ClassId, ClassTable, Ns, Plan};
 use crate::error::{CompileError, Unsupported};
 use crate::options::{BodyMode, Locate, Options};
 use crate::output::Compiled;
@@ -61,12 +62,13 @@ pub(crate) enum Slot {
 /// A parameter, as the calling convention sees it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PInfo {
-    pub(crate) id: ParamId,
+    /// `None` for a static method's hidden receiver.
+    pub(crate) id: Option<ParamId>,
     pub(crate) kind: ParamKind,
     pub(crate) name: Option<Symbol>,
     pub(crate) by_ref: bool,
     pub(crate) default: Option<ExprId>,
-    pub(crate) pat: PatId,
+    pub(crate) pat: Option<PatId>,
 }
 
 impl PInfo {
@@ -79,12 +81,26 @@ impl PInfo {
             _ => None,
         };
         PInfo {
-            id,
+            id: Some(id),
             kind: p.kind,
             name,
             by_ref: p.by_ref,
             default: p.default,
-            pat: p.pat,
+            pat: Some(p.pat),
+        }
+    }
+
+    /// The receiver a static method takes first, so every method is called
+    /// alike (the receiver is the class's token, or the instance it was
+    /// called through: `static::` binds to it).
+    pub(crate) fn hidden_receiver() -> PInfo {
+        PInfo {
+            id: None,
+            kind: ParamKind::Receiver,
+            name: None,
+            by_ref: false,
+            default: None,
+            pat: None,
         }
     }
 
@@ -120,7 +136,17 @@ impl PInfo {
     }
 }
 
-/// A function item.
+/// Which function a body job generates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FnKey {
+    /// A function item.
+    Item(ItemId),
+    /// A method item compiled for a class (a mixin's method once per class
+    /// using it).
+    Method(ClassId, ItemId),
+}
+
+/// A function item, or a method compiled for a class.
 #[derive(Clone, Debug)]
 pub(crate) struct FnInfo {
     /// The function every call reaches: it carries the parameter list (a
@@ -136,6 +162,12 @@ pub(crate) struct FnInfo {
     /// Per parameter, the global holding a default evaluated once.
     pub(crate) once: Vec<Option<GlobalId>>,
     pub(crate) name: String,
+    /// The class a method is compiled for (its `self::` and visibility
+    /// scope).
+    pub(crate) class: Option<ClassId>,
+    /// A static method: `params[0]` is the hidden receiver, not a HIR
+    /// parameter.
+    pub(crate) hidden_recv: bool,
 }
 
 /// A capture of a closure, in upvalue order.
@@ -153,9 +185,9 @@ pub(crate) enum Cap {
 
 /// A function body waiting to be generated.
 pub(crate) enum Job {
-    /// A function item's code (a generator's coroutine body).
+    /// A function item's or method's code (a generator's coroutine body).
     Body {
-        item: ItemId,
+        key: FnKey,
         f: FunctionBuilder,
     },
     /// A generator's callable: makes the coroutine of `body` from its
@@ -178,6 +210,13 @@ pub(crate) enum Job {
         /// A generator closure's body: its captures arrive as the leading
         /// parameters, not as upvalues.
         caps_in_params: bool,
+        /// The class scope it was created in.
+        scope: Option<ClassScope>,
+    },
+    /// A class's synthetic code (see `codegen/class.rs`).
+    Class {
+        f: FunctionBuilder,
+        what: ClassJob,
     },
     Start {
         f: FunctionBuilder,
@@ -193,6 +232,70 @@ pub(crate) enum Job {
     PhpKey {
         f: FunctionBuilder,
     },
+}
+
+/// The class context of the code being generated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClassScope {
+    /// The class (`self::`, visibility).
+    pub(crate) class: ClassId,
+    /// The method's `$this` binder, when it has one (closures reach the
+    /// instance through it when they captured it).
+    pub(crate) this: Option<BinderId>,
+}
+
+/// A synthetic class function.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ClassJob {
+    /// `::new`: allocate and initialize the properties (or raise for an
+    /// abstract class or an interface).
+    Alloc(ClassId),
+    /// `::test`: whether the argument is an instance.
+    Test(ClassId),
+    /// `::class`: the class's name (`static::class`).
+    Name(ClassId),
+    /// A static property's or constant's accessor: returns the global
+    /// (a static's reference, a constant's value).
+    Accessor(GlobalId),
+    /// `<vis name>(obj, scope_token, scope_text)`: the shared visibility
+    /// check of a member name for an object that is not an instance of
+    /// the accessing scope (see `ClassTable::outside`); raises or returns.
+    Vis(Ns, Symbol),
+    /// The function every interface marker names (never meant to be
+    /// called; returns nil).
+    Marker,
+    /// `<class_of>(v)`: the token of the class `v` names (an object's own,
+    /// a registered name's), else nil.
+    ClassOf,
+    /// `<noop>(recv, ...)`: what `new` calls when the class has no
+    /// constructor.
+    Noop,
+    /// An access by a run-time name (`$o->$name`, `$o->$m()`) from a scope:
+    /// a search over the unit's member names, then the scope's access.
+    Dyn(Option<ClassId>, DynOp),
+}
+
+/// What a by-name access does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DynOp {
+    /// `(obj, name)`: read the property.
+    Get,
+    /// `(obj, name, value)`: write the property.
+    Set,
+    /// `(obj, name)`: the method, as a function value.
+    Method,
+}
+
+/// Run-time handles of one class or interface.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ClassRt {
+    /// The struct type (classes and interfaces; mixins have none).
+    pub(crate) ty: Option<TypeId>,
+    /// The global holding the class's token: an uninitialized instance that
+    /// stands for the class in static calls (`static::` binds to it).
+    pub(crate) token: Option<GlobalId>,
+    /// `::new`.
+    pub(crate) alloc: Option<FuncId>,
 }
 
 /// The module being generated.
@@ -218,6 +321,30 @@ pub(crate) struct Cx<'a, L: Lookup> {
     pub(crate) closures: u32,
     pub(crate) statics: u32,
     pub(crate) file: StrId,
+    /// The unit's classes.
+    pub(crate) ct: ClassTable,
+    /// Per class: its run-time handles.
+    pub(crate) crt: Vec<ClassRt>,
+    /// Methods compiled per class.
+    pub(crate) methods: BTreeMap<(ClassId, ItemId), FnInfo>,
+    /// Static properties (a global holding a reference) and constants (a
+    /// global holding the value), per class that holds them.
+    pub(crate) member_globals: BTreeMap<(ClassId, ItemId), GlobalId>,
+    /// Visibility plans, per scope, namespace, and name.
+    pub(crate) plans: BTreeMap<(Option<ClassId>, Ns, Symbol), Plan>,
+    /// The global holding the name → token registry.
+    pub(crate) registry: Option<GlobalId>,
+    /// Synthetic functions, declared on first use.
+    pub(crate) class_of: Option<FuncId>,
+    pub(crate) noop: Option<FuncId>,
+    pub(crate) marker: Option<FuncId>,
+    pub(crate) scratch: Option<GlobalId>,
+    /// By-name access functions, per scope and operation.
+    pub(crate) dyn_access: BTreeMap<(Option<ClassId>, DynOp), FuncId>,
+    /// Shared visibility checks, per member name.
+    pub(crate) vis_checks: BTreeMap<(Ns, Symbol), FuncId>,
+    /// The LSB name of the destructor method, when a class has one.
+    pub(crate) destructor: Option<String>,
 }
 
 impl<L: Lookup> Cx<'_, L> {
@@ -324,6 +451,103 @@ impl<L: Lookup> Cx<'_, L> {
         }
     }
 
+    /// A writable global no code reads: the slot of a write that raises
+    /// before it happens (an undeclared static property).
+    pub(crate) fn scratch_global(&mut self) -> GlobalId {
+        if let Some(g) = self.scratch {
+            return g;
+        }
+        let g = self.mb.global("<scratch>", ValType::Dyn, true, None);
+        self.scratch = Some(g);
+        g
+    }
+
+    /// The by-name access function of `op` from `scope`, declared on first
+    /// use.
+    pub(crate) fn dyn_fn(&mut self, scope: Option<ClassId>, op: DynOp) -> FuncId {
+        if let Some(&f) = self.dyn_access.get(&(scope, op)) {
+            return f;
+        }
+        let params: &[ValType] = match op {
+            DynOp::Set => &[ValType::Dyn, ValType::Dyn, ValType::Dyn],
+            _ => &[ValType::Dyn, ValType::Dyn],
+        };
+        let name = match op {
+            DynOp::Get => "<dyn get>",
+            DynOp::Set => "<dyn set>",
+            DynOp::Method => "<dyn method>",
+        };
+        let f = self.mb.function(name, params, &[ValType::Dyn]);
+        let id = f.id();
+        let _ = self.dyn_access.insert((scope, op), id);
+        self.jobs.push_back(Job::Class {
+            f,
+            what: ClassJob::Dyn(scope, op),
+        });
+        id
+    }
+
+    /// The shared visibility check of `name` in `ns`, declared on first use
+    /// (see `ClassJob::Vis`).
+    pub(crate) fn vis_fn(&mut self, ns: Ns, name: Symbol) -> FuncId {
+        if let Some(&f) = self.vis_checks.get(&(ns, name)) {
+            return f;
+        }
+        let label = alloc::format!("<vis {}>", self.text(name));
+        let f = self.mb.function(
+            &label,
+            &[ValType::Dyn, ValType::Dyn, ValType::Dyn],
+            &[ValType::Dyn],
+        );
+        let id = f.id();
+        let _ = self.vis_checks.insert((ns, name), id);
+        self.jobs.push_back(Job::Class {
+            f,
+            what: ClassJob::Vis(ns, name),
+        });
+        id
+    }
+
+    /// `<class_of>`, declared on first use (see `ClassJob::ClassOf`).
+    pub(crate) fn class_of_fn(&mut self) -> FuncId {
+        if let Some(f) = self.class_of {
+            return f;
+        }
+        let f = self
+            .mb
+            .function("<class_of>", &[ValType::Dyn], &[ValType::Dyn]);
+        let id = f.id();
+        self.class_of = Some(id);
+        self.jobs.push_back(Job::Class {
+            f,
+            what: ClassJob::ClassOf,
+        });
+        id
+    }
+
+    /// `<noop>(recv, ...rest)`, declared on first use: binds any arguments
+    /// and returns nil (what `new` calls for a class without a
+    /// constructor).
+    pub(crate) fn noop_fn(&mut self) -> FuncId {
+        if let Some(f) = self.noop {
+            return f;
+        }
+        let mut f = self
+            .mb
+            .function("<noop>", &[ValType::Dyn, ValType::Dyn], &[ValType::Dyn]);
+        f.set_params(ParamList::new(alloc::vec![
+            LParam::new(LParamKind::PositionalOnly, None),
+            LParam::new(LParamKind::RestMap, None),
+        ]));
+        let id = f.id();
+        self.noop = Some(id);
+        self.jobs.push_back(Job::Class {
+            f,
+            what: ClassJob::Noop,
+        });
+        id
+    }
+
     /// The direct-call function of PHP key coercion, declared on first use.
     pub(crate) fn php_key(&mut self) -> FuncId {
         if let Some(f) = self.php_key {
@@ -373,7 +597,12 @@ impl<L: Lookup> Cx<'_, L> {
             }
             out.push(lp);
         }
-        ParamList::new(out)
+        let list = ParamList::new(out);
+        if self.opts.ignore_extra() {
+            list.ignoring_extra()
+        } else {
+            list
+        }
     }
 
     /// The constant a literal loads, or `None` for `null` (the default of a
@@ -480,10 +709,20 @@ pub(crate) fn compile<L: Lookup>(
     if let Some(item) = an.unsupported_item {
         let node = NodeRef::Item(item);
         return Err(CompileError::Unsupported {
-            feature: Unsupported::Class,
+            feature: Unsupported::Impl,
             node,
             span: hir.origin(node).span,
         });
+    }
+    if let Some(name) = opts.string_offsets() {
+        let ok = opts.intrinsics().get(name).is_some_and(|d| {
+            d.arity().accepts(2) && !matches!(d.lowering(), crate::Lowering::Class { .. })
+        });
+        if !ok {
+            return Err(CompileError::InvalidOption {
+                option: "string_offsets",
+            });
+        }
     }
     let mut mb = ModuleBuilder::new();
     let map = mb.add_type(TypeDef::Map {
@@ -517,6 +756,19 @@ pub(crate) fn compile<L: Lookup>(
         closures: 0,
         statics: 0,
         file,
+        ct: ClassTable::default(),
+        crt: Vec::new(),
+        methods: BTreeMap::new(),
+        member_globals: BTreeMap::new(),
+        plans: BTreeMap::new(),
+        registry: None,
+        class_of: None,
+        noop: None,
+        marker: None,
+        scratch: None,
+        dyn_access: BTreeMap::new(),
+        vis_checks: BTreeMap::new(),
+        destructor: None,
     };
 
     // Hooks bound to host functions.
@@ -530,7 +782,10 @@ pub(crate) fn compile<L: Lookup>(
     }
 
     declare_functions(&mut cx)?;
+    crate::members::declare_classes(&mut cx)?;
     let mut prelude = declare_globals(&mut cx)?;
+    // Class tokens, the registry, statics, and constants start there.
+    prelude |= !cx.ct.is_empty();
     let root = hir.root();
     let body = match hir.item(root).kind {
         ItemKind::Module { body, .. } => body,
@@ -595,6 +850,22 @@ pub(crate) fn compile<L: Lookup>(
         .iter()
         .filter_map(|(&item, info)| info.callable.map(|b| (item, b)))
         .collect();
+    let classes: Vec<(ItemId, TypeId)> = cx
+        .ct
+        .classes
+        .iter()
+        .zip(cx.crt.iter())
+        .filter_map(|(d, rt)| rt.ty.map(|t| (d.item, t)))
+        .collect();
+    let methods: Vec<((ItemId, ItemId), FuncId)> = cx
+        .methods
+        .iter()
+        .filter_map(|(&(c, item), info)| {
+            let class = cx.ct.get(c)?.item;
+            info.callable.map(|f| ((class, item), f))
+        })
+        .collect();
+    let destructor = cx.destructor.take();
     let module = cx.mb.finish()?;
     let count = module.functions().len();
     let mut origins: Vec<Vec<NodeRef>> = Vec::with_capacity(count);
@@ -609,6 +880,9 @@ pub(crate) fn compile<L: Lookup>(
         result,
         functions,
         origins,
+        classes,
+        methods,
+        destructor,
     })
 }
 
@@ -633,6 +907,7 @@ fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> 
             return Err(cx.unsupported(Unsupported::Class, node));
         }
         check_params(&params, 0, node, cx.span(node))?;
+        let key = FnKey::Item(item);
         let name = it.name.map(|n| cx.text(n.sym)).unwrap_or_default();
         let has_mask = params.iter().any(|p| p.default.is_some());
         let mut sig: Vec<ValType> = params.iter().map(|p| p.reg_type(&cx.types)).collect();
@@ -666,7 +941,7 @@ fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> 
                 gname.push_str("$gen");
                 let g = cx.mb.function(&gname, &sig, &[ValType::Dyn]);
                 let gid = g.id();
-                cx.jobs.push_back(Job::Body { item, f: g });
+                cx.jobs.push_back(Job::Body { key, f: g });
                 cx.jobs.push_back(Job::GenEntry {
                     f,
                     body: gid,
@@ -676,7 +951,7 @@ fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> 
                 });
                 (Some(id), Some(gid))
             } else {
-                cx.jobs.push_back(Job::Body { item, f });
+                cx.jobs.push_back(Job::Body { key, f });
                 (Some(id), None)
             }
         } else {
@@ -692,6 +967,8 @@ fn declare_functions<L: Lookup>(cx: &mut Cx<'_, L>) -> Result<(), CompileError> 
                 has_mask,
                 once,
                 name,
+                class: None,
+                hidden_recv: false,
             },
         );
     }

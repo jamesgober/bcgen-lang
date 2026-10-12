@@ -11,7 +11,7 @@ use intern_lang::Lookup;
 use super::{Dst, Gen, Rel, Step, Task, Val};
 use crate::error::{CompileError, Unsupported};
 use crate::func::FnCx;
-use crate::unit::{Cap, Cx, Job, PInfo, Slot};
+use crate::unit::{Cap, ClassJob, ClassScope, Cx, FnKey, Job, PInfo, Slot};
 
 /// Where a parameter's default comes from when it is evaluated once.
 #[derive(Clone, Copy, Debug)]
@@ -34,9 +34,13 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
     let hir = cx.hir;
     let root = NodeRef::Item(hir.root());
     match job {
-        Job::Body { item, f } => {
+        Job::Body { key, f } => {
+            let (item, info) = match key {
+                FnKey::Item(item) => (item, cx.fns.get(&item).cloned()),
+                FnKey::Method(c, item) => (item, cx.methods.get(&(c, item)).cloned()),
+            };
             let node = NodeRef::Item(item);
-            let Some(info) = cx.fns.get(&item).cloned() else {
+            let Some(info) = info else {
                 return Ok(());
             };
             let ItemKind::Fn(def) = hir.item(item).kind else {
@@ -44,6 +48,20 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
             };
             let fx = FnCx::new(f, &info.sig, node);
             let mut g = Gen::new(cx, fx);
+            if let Some(class) = info.class {
+                // `$this` is the receiver parameter's binder.
+                let this =
+                    info.params
+                        .first()
+                        .and_then(|p| p.pat)
+                        .and_then(|pat| match *hir.pat(pat) {
+                            Pat::Bind { binder, .. } | Pat::Ident { binder, .. } => Some(binder),
+                            _ => None,
+                        });
+                g.scope = Some(ClassScope { class, this });
+                g.recv = Some(param_reg(0));
+                g.instance = !info.hidden_recv;
+            }
             g.at(node);
             let n = info.params.len();
             let regs: Vec<Reg> = (0..n).map(param_reg).collect();
@@ -103,6 +121,7 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
             caps,
             aliases,
             caps_in_params,
+            scope,
         } => {
             let node = NodeRef::Expr(e);
             let Expr::Closure(c) = *hir.expr(e) else {
@@ -132,6 +151,7 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
             }
             let fx = FnCx::new(f, &sig, node);
             let mut g = Gen::new(cx, fx);
+            g.scope = scope;
             g.at(node);
             let mut once: Vec<Option<Once>> = alloc::vec![None; plist.len()];
             let php = g.php();
@@ -230,6 +250,36 @@ pub(crate) fn run_job<L: Lookup>(cx: &mut Cx<'_, L>, job: Job) -> Result<(), Com
             g.emit(Inst::Ret { src: r });
             g.finish_fn()
         }
+        Job::Class { f, what } => {
+            let params: &[ValType] = match what {
+                ClassJob::Test(_)
+                | ClassJob::Noop
+                | ClassJob::Dyn(_, crate::unit::DynOp::Get | crate::unit::DynOp::Method) => {
+                    &[ValType::Dyn, ValType::Dyn]
+                }
+                ClassJob::Dyn(_, crate::unit::DynOp::Set) => {
+                    &[ValType::Dyn, ValType::Dyn, ValType::Dyn]
+                }
+                _ => &[ValType::Dyn],
+            };
+            let node = match what {
+                ClassJob::Alloc(c) | ClassJob::Test(c) => {
+                    cx.ct.get(c).map_or(root, |d| NodeRef::Item(d.item))
+                }
+                _ => root,
+            };
+            let fx = FnCx::new(f, params, node);
+            let mut g = Gen::new(cx, fx);
+            match what {
+                ClassJob::Alloc(class) | ClassJob::Dyn(Some(class), _) => {
+                    g.scope = Some(ClassScope { class, this: None });
+                }
+                _ => {}
+            }
+            g.at(node);
+            g.class_job(what)?;
+            g.finish_fn()
+        }
         Job::PhpKey { f } => {
             let fx = FnCx::new(f, &[ValType::Dyn], root);
             let mut g = Gen::new(cx, fx);
@@ -277,7 +327,11 @@ impl<L: Lookup> Gen<'_, '_, L> {
         node: NodeRef,
     ) -> Result<(), CompileError> {
         let mut ts: Vec<Task> = Vec::new();
-        for i in 0..params.list.len() {
+        for (i, p) in params.list.iter().enumerate() {
+            // A static method's hidden receiver binds nothing.
+            if p.id.is_none() {
+                continue;
+            }
             ts.push(Task::Step(Step::ParamBind {
                 index: i,
                 reg: params.regs.get(i).copied().unwrap_or(Reg(0)),
@@ -322,7 +376,10 @@ impl<L: Lookup> Gen<'_, '_, L> {
         };
         let mask = params.mask;
         let once = params.once.get(index).copied().flatten();
-        let node = NodeRef::Param(p.id);
+        let (Some(id), Some(pat)) = (p.id, p.pat) else {
+            return Ok(());
+        };
+        let node = NodeRef::Param(id);
         self.at(node);
         let mut ts: Vec<Task> = Vec::new();
         if let (Some(d), Some(mask)) = (p.default, mask) {
@@ -365,7 +422,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
         // The pattern.
         let hir = self.cx.hir;
         ts.push(Task::At(node));
-        match *hir.pat(p.pat) {
+        match *hir.pat(pat) {
             Pat::Bind {
                 binder,
                 mode: BindMode::Value,
@@ -393,11 +450,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
             _ => {
                 let fail = self.label();
                 let ok = self.label();
-                ts.push(Task::Pat {
-                    pat: p.pat,
-                    v: reg,
-                    fail,
-                });
+                ts.push(Task::Pat { pat, v: reg, fail });
                 ts.push(Task::Jump(ok));
                 ts.push(Task::Bind(fail));
                 ts.push(Task::At(node));
@@ -416,9 +469,16 @@ impl<L: Lookup> Gen<'_, '_, L> {
     fn start(&mut self, result: Option<bytecode_lang::GlobalId>) -> Result<(), CompileError> {
         let hir = self.cx.hir;
         let mut ts: Vec<Task> = Vec::new();
-        for &item in &self.cx.an.inits {
+        // Class tokens and the registry come before any code can run.
+        self.class_prologue();
+        let inits = self.cx.an.inits.clone();
+        for item in inits {
             let node = NodeRef::Item(item);
             match hir.item(item).kind {
+                ItemKind::Class(_) | ItemKind::Interface(_) => {
+                    self.class_inits(item, &mut ts);
+                    self.method_onces(item, &mut ts);
+                }
                 ItemKind::Global { init, .. } if self.cx.an.cell_globals.contains(&item) => {
                     // Shared by reference: a cell holding the initial value.
                     let Some(&g) = self.cx.globals.get(&item) else {
@@ -504,6 +564,48 @@ impl<L: Lookup> Gen<'_, '_, L> {
             self.tasks.push(t);
         }
         self.run()
+    }
+
+    /// The once-evaluated parameter defaults of the methods compiled for
+    /// class item `item`, in the class's scope.
+    fn method_onces(&mut self, item: hir_lang::ItemId, ts: &mut Vec<Task>) {
+        let Some(&c) = self.cx.ct.by_item.get(&item) else {
+            return;
+        };
+        let hir = self.cx.hir;
+        let Some(lo) = hir_lang::ItemId::from_index(0) else {
+            return;
+        };
+        let list: Vec<(hir_lang::ItemId, Vec<Option<bytecode_lang::GlobalId>>, bool)> = self
+            .cx
+            .methods
+            .range((c, lo)..)
+            .take_while(|((k, _), _)| *k == c)
+            .filter(|(_, info)| info.once.iter().any(Option::is_some))
+            .map(|(&(_, m), info)| (m, info.once.clone(), info.hidden_recv))
+            .collect();
+        if list.is_empty() {
+            return;
+        }
+        ts.push(Task::SetScope(Some(ClassScope {
+            class: c,
+            this: None,
+        })));
+        for (m, once, hidden) in list {
+            let ItemKind::Fn(def) = hir.item(m).kind else {
+                continue;
+            };
+            let off = usize::from(hidden);
+            for (i, &p) in hir.list(def.params).iter().enumerate() {
+                let (Some(d), Some(Some(g))) = (hir.param(p).default, once.get(i + off)) else {
+                    continue;
+                };
+                ts.push(Task::At(NodeRef::Param(p)));
+                ts.push(Task::Expr(d, Dst::Any));
+                ts.push(Task::Step(Step::SetGlobal(*g)));
+            }
+        }
+        ts.push(Task::SetScope(None));
     }
 
     /// `<php_key>(k)`: PHP's array-key normalization (see

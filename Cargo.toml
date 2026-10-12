@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bcgen-lang"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -66,8 +66,11 @@ intern-lang = { version = "1", default-features = false }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
-# Executes what the compiler emits: the differential, end-to-end, and load tests.
-bvm-lang = "=2.0.0-alpha.3"
+# Executes what the compiler emits: the differential, end-to-end, and load tests
+# (alpha.4: the reference-counting memory profile and `Vm::set_destructor`).
+bvm-lang = "=2.0.0-alpha.4"
+# Resolves the end-to-end programs (the PHP policy), as the LexerSketch chain does.
+resolve-lang = "0.4"
 
 
 # BENCHMARKS

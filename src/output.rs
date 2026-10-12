@@ -2,7 +2,9 @@
 
 use alloc::vec::Vec;
 
-use bytecode_lang::{FuncId, GlobalId, Module};
+use alloc::string::String;
+
+use bytecode_lang::{FuncId, GlobalId, Module, TypeId};
 use hir_lang::{ItemId, NodeRef};
 
 /// A compiled unit: the LSB module, its entry points, and the map from every
@@ -38,6 +40,9 @@ pub struct Compiled {
     pub(crate) result: Option<GlobalId>,
     pub(crate) functions: Vec<(ItemId, FuncId)>,
     pub(crate) origins: Vec<Vec<NodeRef>>,
+    pub(crate) classes: Vec<(ItemId, TypeId)>,
+    pub(crate) methods: Vec<((ItemId, ItemId), FuncId)>,
+    pub(crate) destructor: Option<String>,
 }
 
 impl Compiled {
@@ -165,5 +170,81 @@ impl Compiled {
     #[must_use]
     pub fn origins(&self, func: FuncId) -> &[NodeRef] {
         self.origins.get(func.index()).map_or(&[], Vec::as_slice)
+    }
+
+    /// The LSB struct type of a class or interface item (mixins have none).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Builder, ClassDef, Generics, Item, ItemKind, List, Name};
+    /// use intern_lang::Interner;
+    ///
+    /// let mut names = Interner::new();
+    /// let mut b = Builder::new();
+    /// let class = ClassDef {
+    ///     generics: Generics::default(),
+    ///     bases: List::EMPTY,
+    ///     interfaces: List::EMPTY,
+    ///     fields: List::EMPTY,
+    ///     items: List::EMPTY,
+    ///     is_abstract: false,
+    ///     is_final: false,
+    ///     mixin: false,
+    /// };
+    /// let c = b.item(Item::new(Some(Name::new(names.intern("Point"))), ItemKind::Class(class)));
+    /// let root = b.module(None, &[c]);
+    /// let out = bcgen_lang::compile(&b.finish(root)?, &names)?;
+    /// let ty = out.class_type(c).unwrap();
+    /// assert!(matches!(out.module().types()[ty.index()], bytecode_lang::TypeDef::Struct(_)));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn class_type(&self, class: hir_lang::ItemId) -> Option<TypeId> {
+        self.classes
+            .iter()
+            .find(|(i, _)| *i == class)
+            .map(|&(_, t)| t)
+    }
+
+    /// The function a method item was compiled to for a class (a mixin's
+    /// method has one per class using it; an abstract method has none).
+    ///
+    /// # Examples
+    ///
+    /// See `tests/classes.rs`; a class without methods has none:
+    ///
+    /// ```
+    /// let hir = { let mut b = hir_lang::Builder::new(); let r = b.module(None, &[]); b.finish(r)? };
+    /// let out = bcgen_lang::compile(&hir, &intern_lang::Interner::new())?;
+    /// assert_eq!(out.method(hir.root(), hir.root()), None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn method(&self, class: hir_lang::ItemId, method: hir_lang::ItemId) -> Option<FuncId> {
+        self.methods
+            .iter()
+            .find(|(k, _)| *k == (class, method))
+            .map(|&(_, f)| f)
+    }
+
+    /// The LSB method name of the destructor
+    /// ([`Options::destructor`](crate::Options::destructor), `__destruct()`
+    /// in the PHP profile), when a class of the unit defines one. LSB format
+    /// 2 has no destructor flag: the host passes this name to bvm-lang's
+    /// `Vm::set_destructor` on a VM made with the reference-counting memory
+    /// profile, so destructors run where PHP runs them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let hir = { let mut b = hir_lang::Builder::new(); let r = b.module(None, &[]); b.finish(r)? };
+    /// let out = bcgen_lang::compile(&hir, &intern_lang::Interner::new())?;
+    /// assert_eq!(out.destructor(), None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn destructor(&self) -> Option<&str> {
+        self.destructor.as_deref()
     }
 }

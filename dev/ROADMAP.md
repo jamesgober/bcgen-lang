@@ -171,10 +171,123 @@ Known deviations and gaps (each a precise behaviour, none a crash):
 - **LSB verifier**: still bytecode-lang 0.5; every emitted module is checked
   by bvm-lang's load-time checks.
 
+## v0.4.0 - Classes (DONE, 2026-10-12)
+Mox needs classes for the LexerSketch Demo, so they moved here from v0.5
+(recorded under "Moved" below, per the anti-deferral rule).
+- [x] Classes, objects, and interfaces from HIR: inheritance, interfaces as
+  type tests, mixins (PHP traits); `new` with constructors; instance
+  properties with defaults; methods with `$this`; `parent::`, `self::`,
+  `static::`; static properties and methods, class constants, `instanceof`;
+  visibility violations raised (`TypeError` with PHP's message); exceptions
+  as objects caught by class or interface (non-objects still throw); the
+  destructor's name for bvm-lang alpha.4's `Vm::set_destructor`.
+- [x] resolve-lang 0.4 back in the end-to-end tests (ISSUES P35).
+- [x] `ignore_extra` (ISSUES P34).
+- [x] Mox `(int)` of an out-of-range finite float wraps modulo 2^64 like
+  `zend_dval_to_lval`; NaN and infinities give 0 (ISSUES P41).
+- [x] String-offset reads through a named intrinsic (ISSUES P38), with how
+  LexerSketch uses it (`docs/API.md`, "String offsets").
+
+Delivered:
+- `ClassOp` (`New`, `InstanceOf`, `Clone`; `arity`), `Intrinsics::with_class`,
+  `Lowering::Class`; `Intrinsics::mox()` with `mox.new`, `mox.instanceof`,
+  `mox.clone` as class operations, `mox.str_offset` (`Fast::StrOffset`), and
+  `mox.cast_object` on the host (43 entries).
+- `Options::with_constructor`/`constructor`, `with_destructor`/`destructor`,
+  `with_clone_method`/`clone_method`, `with_reference_counting`/
+  `reference_counting`, `with_ignore_extra`/`ignore_extra`,
+  `with_string_offsets`/`string_offsets`.
+- `Compiled::class_type`, `Compiled::method`, `Compiled::destructor`.
+- `ClassProblem` (`Cycle`, `TooDeep`, `TooManyFields`, `NotAClass`,
+  `NotAnInterface`, `NotAMixin`, `BadDestructor`); `CompileError::Class`,
+  `CompileError::InvalidOption`; `Unsupported::Impl`, `MultipleInheritance`,
+  `ClassValue`, `MixinMember`, `ClassTest`, `AmbiguousClass`, `StaticRef`
+  (`Unsupported::Class` narrowed to a receiver outside a class member).
+- The class table (`src/class.rs`): linking, depths and cycles (iterative),
+  mixin flattening by PHP's `zend_traits_copy_functions` and
+  `zend_add_trait_method`, field layouts, preorder intervals for
+  "descends from", and visibility plans (a scope's lineage plus one shared
+  `<vis name>` check per name, so plans stay linear in the number of
+  classes). Members and synthetic functions (`src/members.rs`), and class
+  code generation (`src/codegen/class.rs`): method dispatch, properties,
+  statics, constants, `new`/`instanceof`/`clone`, by-name access, class
+  type tests, exceptions, and the start function's class prologue.
+- Proof: `tests/classes.rs` (15 programs end to end through resolve-lang
+  0.4, each against PHP's output: inheritance, overriding, interfaces,
+  statics, constants, late static binding, mixins, exceptions by class and
+  interface, visibility, destructor order under reference counting, members
+  by run-time name), `tests/class_model.rs` (every method call and property
+  read from every scope on random hierarchies of up to 12 classes against a
+  model of PHP 8's `zend_std_get_method`/`zend_get_property_offset`; 5,000
+  hierarchies before release, 300 per `cargo test`), `tests/mixins.rs`
+  (flattening against a model of PHP's trait copying; 5,000 before release,
+  400 per run), `tests/hostile_classes.rs` (random class graphs, cyclic,
+  deep, huge, and malformed, compiled and run under budgets in both memory
+  profiles, never a panic; 50,000 before release, 2,000 per run),
+  `tests/limits.rs` (chains of 256 load and 257 are `TooDeep`, huge member
+  counts and deep chains hit the budget), `tests/intrinsics.rs` (P41
+  vectors and 4,000 random float bit patterns against `zend_dval_to_lval`),
+  `tests/features_0_4.rs`, `examples/classes.rs`, class benchmarks.
+
+Dependency wiring (decided here, recorded per the anti-deferral rule):
+- **hir-lang 0.4, bytecode-lang 0.3, intern-lang 1: wired** (unchanged).
+- **bvm-lang =2.0.0-alpha.4: dev-dependency** (alpha.4 adds
+  `Vm::set_destructor` and the reference-counting profile the destructor
+  tests use).
+- **resolve-lang 0.4: dev-dependency again** (its PHP policy resolves the
+  end-to-end and class tests). Two of its gaps are worked around in the
+  tests and reported (below).
+- **lower-lang: not wired** (see "Moved"). **typeck-lang, match-lang: not
+  wired** (typed fast paths and decision trees stay in 0.5).
+
+Moved:
+- **Classes, interfaces, and mixins: from v0.5 to v0.4** (Mox needs them for
+  the Demo). Declared records and sums, and `impl` blocks, stay in v0.5
+  (`Unsupported::Record`, `Unsupported::Impl`).
+- **A lowering-driven end-to-end test stays in v0.5.** lower-lang 0.4 emits
+  no `Receiver` parameter for Mox methods (its `implicit_receiver` is still
+  pending), so a Mox method lowered by it has no `$this` and an instance
+  method cannot work end to end through lower-lang yet. Needed: lower-lang
+  emitting `ParamKind::Receiver` first in every instance method.
+
+Missing pieces, compiled as far as possible and refused precisely (never
+faked); each is in `docs/API.md`'s "covered and refused" table:
+- **HIR**: `Param` has no promoted-property marker (constructor promotion is
+  the lowering's: a property plus an assignment); `FieldDef` has no
+  `readonly` flag and property types are erased (no uninitialized state); no
+  zero-segment `self`/`static` path (a lowering writes `new static` as
+  `new (static::class)`); an interface cannot be named in value position
+  (`instanceof` takes it as the intrinsic's type argument); `final` is
+  recorded but not enforced.
+- **LSB**: no destructor flag in format 2 (ISSUES P44: the host passes
+  `Compiled::destructor()` to `Vm::set_destructor`); structs have fixed
+  fields (PHP's dynamic properties go to the `get_prop`/`set_prop` hooks or
+  raise `UndefinedProperty`); `get_prop` takes a constant name (by-name
+  access is a generated binary search per scope); one parent per struct
+  (`Unsupported::MultipleInheritance`); `dsep_index`/`dref_index` raise on
+  objects (nested writes and references through a run-time property name on
+  an object raise `TypeError`).
+- **resolve-lang 0.4**: rejects a class name in value position ("expected a
+  value, found class"), so the Mox sketch's `new_object` template,
+  `mox.new(Class, ...)`, does not resolve; the tests resolve the class
+  operand themselves. It does not resolve an interface constant through an
+  implementing class (bcgen resolves member paths by name). Its trait member
+  tables differ from PHP on some visibility rules (`tests/mixins.rs` counts
+  and prints them; bcgen follows PHP).
+
+Known deviations (documented in `docs/API.md`): a protected property's
+message names the declaring class (PHP names the object's); constants are
+computed at load in canonical order (PHP evaluates them lazily); a class
+declared inside a function or `if` is declared at load; a closure's
+`static::` is its class's token unless it captured `$this`; by-name dispatch
+functions are generated per scope over every member name of the unit
+(bounded by the instruction budget).
+
 ## v0.5.0 - Implementation
-- [ ] Typed fast paths from typeck-lang; match-lang decision trees; classes, mixins, declared records and sums; register allocation quality and benchmarks. (Coroutines moved up to 0.3, done.)
+- [ ] Typed fast paths from typeck-lang; match-lang decision trees; declared records and sums, `impl` blocks; register allocation quality and benchmarks. (Coroutines moved up to 0.3, done; classes and mixins moved up to 0.4, done.)
 - [ ] (Moved from 0.2) A lowering-driven end-to-end test through lower-lang once it is published on hir-lang 0.4; verifier-checked output once bytecode-lang 0.5 ships the LSB verifier. (References into map slots: done in 0.3, LSB format 2.)
-- [ ] (Moved from 0.3) resolve-lang back in the end-to-end test once it is published on hir-lang 0.4; a language switch for PHP's ignored extra arguments (`ignore_extra`); `dunref_*` where the last holder of a reference is provably gone; `yield from`'s automatic key and advanced delegates if LSB gains the means.
+- [ ] (Moved from 0.3) `dunref_*` where the last holder of a reference is provably gone; `yield from`'s automatic key and advanced delegates if LSB gains the means. (resolve-lang in the end-to-end test and `ignore_extra`: done in 0.4.)
+- [ ] (From 0.4) Mox instance methods end to end through lower-lang once it emits receivers (`implicit_receiver`); the Mox `new_object` template through resolve-lang once it accepts a class in value position; `final` enforcement, `readonly`, and constructor promotion if HIR gains the markers; a destructor flag if LSB gains one (P44).
 
 ## v0.9.0 - Hardening
 - [ ] Differential fuzzing; scale benchmarks; audit with the LexerSketch Demo as the consumer.

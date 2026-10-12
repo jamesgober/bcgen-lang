@@ -1,7 +1,6 @@
-//! End to end: a small Mox program, lowered by hand into HIR the way a
-//! lowering emits it (names unresolved), resolved by a small lexical
-//! resolver in the test (resolve-lang 0.3 is built on hir-lang 0.3, so it
-//! cannot resolve this unit), compiled by bcgen-lang, and run on bvm-lang,
+//! End to end: small Mox programs, lowered by hand into HIR the way a
+//! lowering emits them (names unresolved), resolved by resolve-lang 0.4 under
+//! its PHP policy (ISSUES P35), compiled by bcgen-lang, and run on bvm-lang,
 //! printing through a host function.
 //!
 //! The Mox source it stands for:
@@ -43,6 +42,7 @@ use hir_lang::{
     Arm, Binder, BinderKind, Capture, CaptureMode, Closure, DefaultEval, Effects, Expr, ExprId,
     Lit, Ns, OpKind, ParamKind, Pat, Res, Span,
 };
+use resolve_lang::{DefKind, Export, MapEnv, Namespace, Policy, Resolver};
 
 /// A reference by name, left for the resolver.
 fn name(h: &mut H, s: &str) -> ExprId {
@@ -102,44 +102,25 @@ fn foreach(
     h.stmt(outer)
 }
 
-/// Resolves every unresolved one-segment path: to the innermost local of
-/// that name in scope, else to a root-level function of that name, else to
-/// the host function of that name (what resolve-lang's `php` preset does for
-/// this program).
-fn resolve_by_hand(hir: &mut hir_lang::Hir, names: &intern_lang::Interner) {
-    let root = hir.root();
-    let items: Vec<(String, hir_lang::ItemId)> = match hir.item(root).kind {
-        hir_lang::ItemKind::Module { items, .. } => hir
-            .list(items)
-            .iter()
-            .filter_map(|&i| {
-                let n = hir.item(i).name?;
-                Some((names.resolve(n.sym).unwrap_or("").to_string(), i))
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    for i in 0..hir.count(hir_lang::IdKind::Path) {
-        let Some(p) = hir_lang::PathId::from_index(i) else {
-            continue;
-        };
-        let path = *hir.path(p);
-        if path.res != Res::Unresolved {
-            continue;
-        }
-        let Some(seg) = hir.list(path.segments).first().copied() else {
-            continue;
-        };
-        let text = names.resolve(seg.name.sym).unwrap_or("").to_string();
-        let res = match hir.lookup_local(p, seg.name) {
-            Some(b) => Res::Local(b),
-            None => match items.iter().find(|(n, _)| *n == text) {
-                Some(&(_, item)) => Res::Def(hir.def(hir_lang::Def::Item(item))),
-                None => Res::Extern(seg.name.sym),
-            },
-        };
-        hir.resolve(p, res).expect("resolves");
+/// Resolves the unit with resolve-lang's PHP policy, `echo` being a host
+/// function; the resolution must be clean.
+fn resolve(hir: hir_lang::Hir, names: &intern_lang::Interner) -> hir_lang::Hir {
+    let mut env = MapEnv::new();
+    if let Some(sym) = names.get("echo") {
+        env = env.with_prelude(
+            hir_lang::Name::new(sym),
+            Namespace::Value,
+            Export::new(Res::Extern(sym), DefKind::Extern),
+        );
     }
+    let unit = hir.unit();
+    let res = Resolver::new(Policy::php())
+        .with_env(&env)
+        .resolve(hir, names)
+        .expect("resolves");
+    let problems: Vec<String> = res.diagnostics().iter().map(|d| d.message(names)).collect();
+    assert!(res.is_clean(), "{problems:?}");
+    res.hir(unit).cloned().expect("the unit")
 }
 
 fn program() -> (hir_lang::Hir, intern_lang::Interner) {
@@ -338,8 +319,8 @@ fn program() -> (hir_lang::Hir, intern_lang::Interner) {
 
 #[test]
 fn a_mox_program_runs_end_to_end() {
-    let (mut hir, names) = program();
-    resolve_by_hand(&mut hir, &names);
+    let (hir, names) = program();
+    let hir = resolve(hir, &names);
     let lines = LineIndex::new("main.mox", 0, "");
     let out = Compiler::new(Options::new())
         .with_locator(&lines)

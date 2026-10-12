@@ -9,6 +9,7 @@
 //! values their children pushed.
 
 mod call;
+mod class;
 mod coro;
 mod entry;
 mod expr;
@@ -27,7 +28,7 @@ use intern_lang::Lookup;
 use crate::error::CompileError;
 use crate::func::{Exit, Fin, FnCx, Scoped, Target};
 use crate::options::ArraySemantics;
-use crate::unit::{Cx, Job, Slot};
+use crate::unit::{ClassScope, Cx, Job, Slot};
 
 pub(crate) use entry::run_job;
 
@@ -181,6 +182,9 @@ pub(crate) enum Task {
     },
     /// Continues generating a construct in steps (calls, places, closures).
     Step(Step),
+    /// Switches the class scope (property defaults and class constants
+    /// evaluate in their class's scope).
+    SetScope(Option<ClassScope>),
 }
 
 /// Multi-step constructs: the state each step needs.
@@ -245,6 +249,14 @@ pub(crate) enum Step {
     RaiseTypeError,
     /// Raises `NoMatch` (E0200) with the popped scrutinee as its payload.
     RaiseNoMatch,
+    /// Class operations (see `class.rs`).
+    Class(class::ClassStep),
+    /// Stores the popped value into field `field` of the `ref` struct in
+    /// `obj` (a property default).
+    SetField {
+        obj: Reg,
+        field: bytecode_lang::FieldIdx,
+    },
 }
 
 /// The generator of one function.
@@ -257,10 +269,19 @@ pub(crate) struct Gen<'c, 'a, L: Lookup> {
     /// Evaluated places: `let_place` aliases and the places assignments,
     /// reference assignments, and place arguments are using.
     pub(crate) places: Vec<place::EvPlace>,
+    /// The class scope: a method's class, or the class of the method a
+    /// closure was created in.
+    pub(crate) scope: Option<ClassScope>,
+    /// A method's receiver (register 0).
+    pub(crate) recv: Option<Reg>,
+    /// The method is an instance method (its receiver is `$this`).
+    pub(crate) instance: bool,
 }
 
 impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
     pub(crate) fn new(cx: &'c mut Cx<'a, L>, fx: FnCx) -> Self {
+        let mut fx = fx;
+        fx.clear = cx.opts.reference_counting();
         Gen {
             cx,
             fx,
@@ -268,6 +289,9 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
             vals: Vec::new(),
             params: None,
             places: Vec::new(),
+            scope: None,
+            recv: None,
+            instance: false,
         }
     }
 
@@ -400,6 +424,7 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
             Task::LetPat { pat, else_, node } => self.let_pat(pat, else_, node),
             Task::BindVal { b, v } => self.bind_binder(b, v),
             Task::Step(s) => self.step_multi(s)?,
+            Task::SetScope(s) => self.scope = s,
         }
         Ok(())
     }
@@ -514,6 +539,17 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
                 self.release(v);
                 Ok(())
             }
+            Step::Class(c) => self.class_step(c),
+            Step::SetField { obj, field } => {
+                let v = self.pop();
+                self.emit(Inst::SetField {
+                    obj,
+                    field,
+                    src: v.reg,
+                });
+                self.release(v);
+                Ok(())
+            }
         }
     }
 
@@ -556,12 +592,14 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
 
     pub(crate) fn bind(&mut self, l: Label) {
         self.fx.f.bind(l);
+        self.fx.dead = false;
     }
 
     pub(crate) fn jmp(&mut self, l: Label) {
         self.fx.origins.push(self.fx.node);
         self.cx.emitted += 1;
         let _ = self.fx.f.jmp(l);
+        self.fx.dead = true;
     }
 
     pub(crate) fn jump_on(&mut self, cond: Reg, l: Label, when: bool) {
@@ -572,6 +610,7 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
         } else {
             let _ = self.fx.f.jmp_if_not(cond, l);
         }
+        self.fx.dead = false;
     }
 
     /// Whether array copies are values (PHP).
@@ -916,7 +955,11 @@ impl<'c, 'a, L: Lookup> Gen<'c, 'a, L> {
                 .unwrap_or_default();
             let name = self.cx.mb.string(&name);
             self.fx.f.local(s.reg, name, s.start, end);
-            self.fx.release(s.reg);
+            // Under reference counting a variable keeps its register (and
+            // its value) until the function returns, as a PHP variable does.
+            if !self.fx.clear {
+                self.fx.release(s.reg);
+            }
         }
     }
 

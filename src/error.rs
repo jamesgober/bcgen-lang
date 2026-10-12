@@ -18,13 +18,13 @@ use crate::intrinsics::Arity;
 /// ```
 /// use bcgen_lang::Unsupported;
 ///
-/// assert!(Unsupported::Class.to_string().contains("0.5"));
+/// assert!(Unsupported::Impl.to_string().contains("impl"));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Unsupported {
-    /// Classes, impls, interfaces with bodies, mixins, and receiver parameters
-    /// (0.5).
+    /// A receiver parameter outside a member of a class or mixin (a closure
+    /// or a free function cannot take one).
     Class,
     /// A record or struct literal or pattern naming a declared type, a sum
     /// variant, or a constructor pattern (typed data arrives with classes in
@@ -69,6 +69,32 @@ pub enum Unsupported {
     Cast,
     /// A range pattern bound or type test this release cannot evaluate.
     Pattern,
+    /// An `impl` block (methods of a static language's type): typed fast
+    /// paths, 0.5.
+    Impl,
+    /// A class with more than one base (Python): an LSB struct has one
+    /// parent (LSB §3.1).
+    MultipleInheritance,
+    /// A class, interface, or mixin name used as a value outside `new`,
+    /// `instanceof`, a type test, and member access (`Foo::class` and
+    /// class values are the lowering's job).
+    ClassValue,
+    /// A member reached through a mixin (PHP trait) itself, `T::m()`: only
+    /// the classes that use the mixin have its members (PHP 8.1 deprecates
+    /// calling a trait's static members directly).
+    MixinMember,
+    /// A type test (`catch`, `instanceof` by type) against a class or
+    /// interface the unit does not declare: its struct type is not in the
+    /// module.
+    ClassTest,
+    /// A static member path (`C::m`) whose class the compiler cannot pick:
+    /// the unit declares two classes of that name that both reach the
+    /// member.
+    AmbiguousClass,
+    /// Binding a late-bound static property to a reference
+    /// (`static::$x = &$y`): the reference lives in a global the accessor
+    /// only reads.
+    StaticRef,
 }
 
 impl Unsupported {
@@ -84,9 +110,7 @@ impl Unsupported {
     #[must_use]
     pub const fn describe(self) -> &'static str {
         match self {
-            Self::Class => {
-                "classes, impls, mixins, and receiver parameters arrive in bcgen-lang 0.5"
-            }
+            Self::Class => "a receiver parameter outside a class or mixin member",
             Self::Record => {
                 "declared record, struct, and sum types arrive with classes in bcgen-lang 0.5"
             }
@@ -113,6 +137,85 @@ impl Unsupported {
             Self::Conversion => "a conversion at a width dynamic values do not have",
             Self::Cast => "a cast to a type the dynamic profile cannot test or produce",
             Self::Pattern => "a pattern form the dynamic profile cannot test",
+            Self::Impl => {
+                "impl blocks (static-language methods) arrive with typed fast paths in bcgen-lang 0.5"
+            }
+            Self::MultipleInheritance => {
+                "a class with more than one base (an LSB struct has one parent)"
+            }
+            Self::ClassValue => {
+                "a class name used as a value outside new, instanceof, type tests, and member access"
+            }
+            Self::MixinMember => {
+                "a member reached through a mixin itself (only the classes using it have its members)"
+            }
+            Self::ClassTest => "a type test against a class or interface the unit does not declare",
+            Self::AmbiguousClass => {
+                "a static member path naming one of two same-named classes that both reach the member"
+            }
+            Self::StaticRef => "binding a late-bound static property to a reference",
+        }
+    }
+}
+
+/// A class graph or class member LSB cannot hold, or one PHP rejects at
+/// compile time.
+///
+/// # Examples
+///
+/// ```
+/// use bcgen_lang::ClassProblem;
+///
+/// assert!(ClassProblem::Cycle.to_string().contains("cycle"));
+/// assert!(ClassProblem::TooDeep { limit: 256 }.to_string().contains("256"));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClassProblem {
+    /// A class that is its own ancestor, or a mixin that uses itself.
+    Cycle,
+    /// An inheritance chain longer than `limit` classes (bvm-lang's load-time
+    /// limit, `MAX_INHERITANCE_DEPTH`).
+    TooDeep {
+        /// The deepest chain allowed.
+        limit: u32,
+    },
+    /// A class whose instances would have more than `limit` property slots,
+    /// its ancestors' included (an LSB field slot is 16 bits).
+    TooManyFields {
+        /// The most slots allowed.
+        limit: u32,
+    },
+    /// A base that is not a class of the unit (an interface, a mixin, or
+    /// something that is not a class at all).
+    NotAClass,
+    /// An implemented interface or interface parent that is not an
+    /// interface of the unit.
+    NotAnInterface,
+    /// A used mixin that is not a mixin (PHP trait) of the unit.
+    NotAMixin,
+    /// A destructor (see [`Options::destructor`](crate::Options::destructor))
+    /// that takes parameters or is static: bvm-lang calls it with the
+    /// instance alone.
+    BadDestructor,
+}
+
+impl fmt::Display for ClassProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cycle => f.write_str("an inheritance or mixin cycle"),
+            Self::TooDeep { limit } => {
+                write!(f, "an inheritance chain deeper than {limit} classes")
+            }
+            Self::TooManyFields { limit } => {
+                write!(f, "a class with more than {limit} property slots")
+            }
+            Self::NotAClass => f.write_str("a base that is not a class of the unit"),
+            Self::NotAnInterface => {
+                f.write_str("an interface that is not an interface of the unit")
+            }
+            Self::NotAMixin => f.write_str("a used mixin that is not a mixin of the unit"),
+            Self::BadDestructor => f.write_str("a destructor that takes parameters or is static"),
         }
     }
 }
@@ -242,6 +345,23 @@ pub enum CompileError {
         /// Its source span.
         span: Span,
     },
+    /// A class graph or member the module cannot hold (see
+    /// [`ClassProblem`]); `node` is the class or member.
+    Class {
+        /// What is wrong.
+        problem: ClassProblem,
+        /// The class or member.
+        node: NodeRef,
+        /// Its span.
+        span: Span,
+    },
+    /// An option names something the compiler cannot use: `option` is the
+    /// option's name (`string_offsets`: the intrinsic is not in the table or
+    /// does not take two operands).
+    InvalidOption {
+        /// The option.
+        option: &'static str,
+    },
     /// The instruction budget ([`Options::with_max_instructions`]) ran out.
     ///
     /// [`Options::with_max_instructions`]: crate::Options::with_max_instructions
@@ -276,8 +396,9 @@ impl CompileError {
             | Self::IntrinsicArity { node, .. }
             | Self::TooManyArgs { node, .. }
             | Self::TooManyParams { node, .. }
-            | Self::TooManyJumps { node, .. } => Some(node),
-            Self::BudgetExceeded { .. } | Self::Build(_) => None,
+            | Self::TooManyJumps { node, .. }
+            | Self::Class { node, .. } => Some(node),
+            Self::BudgetExceeded { .. } | Self::Build(_) | Self::InvalidOption { .. } => None,
         }
     }
 
@@ -302,8 +423,9 @@ impl CompileError {
             | Self::IntrinsicArity { span, .. }
             | Self::TooManyArgs { span, .. }
             | Self::TooManyParams { span, .. }
-            | Self::TooManyJumps { span, .. } => Some(span),
-            Self::BudgetExceeded { .. } | Self::Build(_) => None,
+            | Self::TooManyJumps { span, .. }
+            | Self::Class { span, .. } => Some(span),
+            Self::BudgetExceeded { .. } | Self::Build(_) | Self::InvalidOption { .. } => None,
         }
     }
 }
@@ -343,6 +465,13 @@ impl fmt::Display for CompileError {
                 f,
                 "finally at {span:?} is left by more than 124 distinct jump targets"
             ),
+            Self::Class { problem, span, .. } => write!(f, "class at {span:?}: {problem}"),
+            Self::InvalidOption { option } => {
+                write!(
+                    f,
+                    "option `{option}` names something the compiler cannot use"
+                )
+            }
             Self::BudgetExceeded { limit } => {
                 write!(f, "the instruction budget of {limit} ran out")
             }

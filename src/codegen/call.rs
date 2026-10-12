@@ -21,6 +21,8 @@ use alloc::vec::Vec;
 
 use bytecode_lang::{ArgKind as LArgKind, CallShape, FuncId, ImportId, Inst, Reg, ValType};
 use hir_lang::{Arg, ArgKind, ExprId, ItemKind, List, NodeRef, ParamKind, Res, Symbol};
+
+use crate::unit::FnInfo;
 use intern_lang::Lookup;
 
 use super::place::PlaceStep;
@@ -28,6 +30,9 @@ use super::{Dst, Gen, Rel, Step, Task, Val};
 use crate::error::{CompileError, Unsupported};
 use crate::func::FnCx;
 use crate::unit::{MAX_ARITY, PInfo};
+
+/// A dynamic call's window, its argument kinds, and the tasks that fill it.
+pub(crate) type DynArgs = ((u32, Reg), Vec<LArgKind>, Vec<Task>);
 
 /// What a direct call runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +77,7 @@ pub(crate) enum CallStep {
     /// The callee (and, for a method, the receiver below it) is on the value
     /// stack: allocate the window and evaluate the arguments into it.
     ValueBegin {
-        args: List<Arg>,
+        args: Vec<Arg>,
         recv: bool,
         dst: Dst,
         node: NodeRef,
@@ -112,13 +117,17 @@ enum To {
     RestNamedInRest(Symbol),
     /// The named rest parameter, under its name.
     RestNamed(Symbol),
+    /// Nowhere: an extra positional argument the callee ignores
+    /// ([`Options::with_ignore_extra`](crate::Options::with_ignore_extra)),
+    /// evaluated for its effects.
+    Ignore,
 }
 
 /// Matches arguments to parameters at compile time by LSB §5.15's binding
 /// rules (the ones the VM applies to a dynamic call); `None` if the call
 /// must bind at run time (a spread, a by-reference rest parameter) or does
 /// not bind (the VM then raises `ArgumentError` at the call).
-fn arrange(params: &[PInfo], args: &[Arg]) -> Option<(Vec<To>, u64)> {
+fn arrange(params: &[PInfo], args: &[Arg], ignore_extra: bool) -> Option<(Vec<To>, u64)> {
     let mut filled = alloc::vec![false; params.len()];
     let positional: Vec<usize> = (0..params.len())
         .filter(|&i| params.get(i).is_some_and(PInfo::positional))
@@ -143,11 +152,14 @@ fn arrange(params: &[PInfo], args: &[Arg]) -> Option<(Vec<To>, u64)> {
                         *filled.get_mut(j)? = true;
                         out.push(To::Param(j));
                     }
-                    None => {
-                        let r = rest?;
-                        *filled.get_mut(r)? = true;
-                        out.push(To::Rest);
-                    }
+                    None => match rest {
+                        Some(r) => {
+                            *filled.get_mut(r)? = true;
+                            out.push(To::Rest);
+                        }
+                        None if ignore_extra => out.push(To::Ignore),
+                        None => return None,
+                    },
                 }
             }
             ArgKind::Named(id) => {
@@ -207,9 +219,24 @@ impl<L: Lookup> Gen<'_, '_, L> {
         if let hir_lang::Expr::Path(p) = *hir.expr(callee) {
             let path = *hir.path(p);
             let cnode = NodeRef::Expr(callee);
+            // `C::m()`, `self::m()`, `parent::m()`, `static::m()`.
+            if self.member_call(p, hir.list(args), dst, node)? {
+                return Ok(());
+            }
             if path.unresolved == 0 {
                 match path.res {
                     Res::Extern(sym) => {
+                        // Lowering templates call host symbols: a class
+                        // operation of the table compiles inline.
+                        let text = self.cx.text(sym);
+                        if let Some(crate::Lowering::Class { op, module, name }) =
+                            self.cx.opts.intrinsics().get(&text).map(|d| d.lowering())
+                        {
+                            let host = (module.clone(), name.clone());
+                            let op = *op;
+                            let list = hir.list(args).to_vec();
+                            return self.class_op(op, host, None, &list, dst, node);
+                        }
                         let (module, name) = self.cx.host_name(sym);
                         return self.import_call(&module, &name, args, dst, node);
                     }
@@ -240,7 +267,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
         self.sched([
             Task::Expr(callee, Dst::Temp),
             Task::Step(Step::Call(CallStep::ValueBegin {
-                args,
+                args: hir.list(args).to_vec(),
                 recv: false,
                 dst,
                 node,
@@ -263,7 +290,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
     ) {
         let node = NodeRef::Expr(e);
         let begin = Task::Step(Step::Call(CallStep::ValueBegin {
-            args,
+            args: self.cx.hir.list(args).to_vec(),
             recv: true,
             dst,
             node,
@@ -335,34 +362,57 @@ impl<L: Lookup> Gen<'_, '_, L> {
         dst: Dst,
         node: NodeRef,
     ) -> Result<(), CompileError> {
-        let hir = self.cx.hir;
-        let list = hir.list(args);
         let Some(info) = self.cx.fns.get(&item).cloned() else {
             return Ok(());
         };
+        let list = self.cx.hir.list(args);
+        self.direct_with(&info, None, list, dst, node)
+    }
+
+    /// A call of a known function (a method when `recv` is given: the
+    /// receiver goes first). The arguments are arranged at compile time by
+    /// the callee's binding rules; when they cannot be (spreads, arguments
+    /// that do not bind), the function value is called dynamically and the
+    /// VM binds them (or raises `ArgumentError` there).
+    pub(crate) fn direct_with(
+        &mut self,
+        info: &FnInfo,
+        recv: Option<Val>,
+        list: &[Arg],
+        dst: Dst,
+        node: NodeRef,
+    ) -> Result<(), CompileError> {
         let Some(callable) = info.callable else {
+            if let Some(r) = recv {
+                self.release(r);
+            }
             return Ok(());
         };
-        let Some((dests, mask)) = arrange(&info.params, list) else {
-            // Spreads, or arguments that do not bind: a dynamic call of the
-            // function value binds them at run time (or raises
-            // `ArgumentError` there).
+        let off = usize::from(recv.is_some());
+        let user = info.params.get(off..).unwrap_or(&[]);
+        let arranged = arrange(user, list, self.cx.opts.ignore_extra());
+        let Some((dests, mask)) = arranged else {
             let f = self.fx.temp(ValType::Dyn);
             self.emit(Inst::MakeClosure {
                 dst: f,
                 func: callable,
             });
+            if let Some(r) = recv {
+                self.vals.push(r);
+            }
             self.vals.push(Val {
                 reg: f,
                 rel: Rel::Temp,
             });
             return self.call_step(CallStep::ValueBegin {
-                args,
-                recv: false,
+                args: list.to_vec(),
+                recv: recv.is_some(),
                 dst,
                 node,
             });
         };
+        // The receiver's presence bit is set: it is always passed.
+        let mask = (mask << off) | u64::from(recv.is_some());
         let target = match info.gen_body {
             Some(g) => Direct::Coro(g),
             None => Direct::Call(callable),
@@ -371,8 +421,15 @@ impl<L: Lookup> Gen<'_, '_, L> {
         shape.extend_from_slice(&info.sig);
         let win = self.fx.window(&shape);
         let n = info.params.len();
+        if let Some(r) = recv {
+            self.emit(Inst::Mov {
+                dst: FnCx::slot(win.1, 1),
+                src: r.reg,
+            });
+            self.release(r);
+        }
         // Absent parameters are nil; the mask says which are present.
-        for i in 0..n {
+        for i in off..n {
             let filled = i < 64 && mask & (1 << i) != 0;
             let is_rest = info.params.get(i).is_some_and(PInfo::rest);
             if !filled && !is_rest {
@@ -409,6 +466,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
         for (a, to) in list.iter().zip(dests.iter()) {
             match *to {
                 To::Param(j) => {
+                    let j = j + off;
                     let slot = FnCx::slot(win.1, j + 1);
                     let by_ref = info.params.get(j).is_some_and(|p| p.by_ref);
                     if by_ref && a.place {
@@ -454,6 +512,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                         });
                     }
                 }
+                To::Ignore => ts.push(Task::Expr(a.value, Dst::Discard)),
             }
         }
         self.sched_all(ts);
@@ -464,12 +523,33 @@ impl<L: Lookup> Gen<'_, '_, L> {
     /// are on the value stack.
     fn value_begin(
         &mut self,
-        args: List<Arg>,
+        args: &[Arg],
         recv: bool,
         dst: Dst,
         node: NodeRef,
     ) -> Result<(), CompileError> {
-        let list = self.cx.hir.list(args);
+        let (win, kinds, mut ts) = self.dynamic_args(args, recv, node)?;
+        ts.push(Task::Step(Step::Call(CallStep::ValueFinish {
+            win,
+            kinds,
+            recv,
+            dst,
+            node,
+        })));
+        self.sched_all(ts);
+        Ok(())
+    }
+
+    /// The window and argument kinds of a dynamic call whose callee (and
+    /// receiver, below it) are on the value stack, and the tasks that
+    /// evaluate the arguments into it. The receiver is copied into the
+    /// window now.
+    pub(crate) fn dynamic_args(
+        &mut self,
+        list: &[Arg],
+        recv: bool,
+        node: NodeRef,
+    ) -> Result<DynArgs, CompileError> {
         let n = list.len() + usize::from(recv);
         if n > MAX_ARITY {
             return Err(self.too_many_args(node));
@@ -541,15 +621,30 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 _ => ts.extend(self.store_expr_tasks(a.value, slot)),
             }
         }
-        ts.push(Task::Step(Step::Call(CallStep::ValueFinish {
-            win,
-            kinds,
-            recv,
-            dst,
-            node,
-        })));
-        self.sched_all(ts);
-        Ok(())
+        Ok((win, kinds, ts))
+    }
+
+    /// The dynamic call over a filled window: `dcall`, `dcall_shape`, or,
+    /// for a positional or spread argument after a named one, the
+    /// `ArgumentError` the binder raises (LSB §5.15 step 3a).
+    pub(crate) fn dynamic_call(&mut self, win: (u32, Reg), kinds: &[LArgKind], callee: Reg) {
+        let argc = u8::try_from(kinds.len()).unwrap_or(u8::MAX);
+        if kinds.iter().all(|k| *k == LArgKind::Positional) {
+            self.emit(Inst::DCall {
+                dst: win.1,
+                callee,
+                argc,
+            });
+        } else if CallShape::new(kinds.to_vec()).validate().is_ok() {
+            let shape = self.fx.f.call_shape(kinds);
+            self.emit(Inst::DCallShape {
+                dst: win.1,
+                callee,
+                shape,
+            });
+        } else {
+            self.raise_kind(bytecode_lang::ErrorKind::ArgumentError);
+        }
     }
 
     pub(crate) fn call_step(&mut self, s: CallStep) -> Result<(), CompileError> {
@@ -621,7 +716,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 node,
             } => {
                 self.at(node);
-                self.value_begin(args, recv, dst, node)?;
+                self.value_begin(&args, recv, dst, node)?;
             }
             CallStep::ValueFinish {
                 win,
@@ -632,26 +727,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
             } => {
                 self.at(node);
                 let callee = self.pop();
-                let argc = u8::try_from(kinds.len()).unwrap_or(u8::MAX);
-                if kinds.iter().all(|k| *k == LArgKind::Positional) {
-                    self.emit(Inst::DCall {
-                        dst: win.1,
-                        callee: callee.reg,
-                        argc,
-                    });
-                } else if CallShape::new(kinds.clone()).validate().is_ok() {
-                    let shape = self.fx.f.call_shape(&kinds);
-                    self.emit(Inst::DCallShape {
-                        dst: win.1,
-                        callee: callee.reg,
-                        shape,
-                    });
-                } else {
-                    // A positional or spread argument after a named one:
-                    // what the binder raises (LSB §5.15 step 3a), once every
-                    // argument was evaluated.
-                    self.raise_kind(bytecode_lang::ErrorKind::ArgumentError);
-                }
+                self.dynamic_call(win, &kinds, callee.reg);
                 self.release(callee);
                 if recv {
                     let r = self.pop();
@@ -725,12 +801,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     rel: Rel::Keep,
                 });
                 let f = self.fx.temp(ValType::Dyn);
-                let name = self.name_ref(name);
-                self.emit(Inst::GetProp {
-                    dst: f,
-                    obj: recv.reg,
-                    name,
-                });
+                self.method_lookup(f, recv.reg, name);
                 self.vals.push(Val {
                     reg: f,
                     rel: Rel::Temp,
@@ -744,11 +815,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     rel: Rel::Keep,
                 });
                 let f = self.fx.temp(ValType::Dyn);
-                self.emit(Inst::DGetIndex {
-                    dst: f,
-                    obj: recv.reg,
-                    key: name.reg,
-                });
+                self.dyn_access(crate::unit::DynOp::Method, f, recv.reg, name.reg, None);
                 self.release(name);
                 self.vals.push(Val {
                     reg: f,
@@ -798,12 +865,12 @@ mod tests {
 
     fn param(i: u32, kind: ParamKind, default: bool) -> PInfo {
         PInfo {
-            id: ParamId::from_index(i as usize).unwrap_or_else(|| panic!("id")),
+            id: ParamId::from_index(i as usize),
             kind,
             name: Some(sym(i)),
             by_ref: false,
             default: default.then(|| ExprId::from_index(0).unwrap_or_else(|| panic!("id"))),
-            pat: PatId::from_index(0).unwrap_or_else(|| panic!("id")),
+            pat: PatId::from_index(0),
         }
     }
 
@@ -827,15 +894,15 @@ mod tests {
             param(3, ParamKind::NamedOnly, true),
         ];
         let (to, mask) =
-            arrange(&ps, &[pos(), pos(), pos(), named(3)]).unwrap_or_else(|| panic!("fits"));
+            arrange(&ps, &[pos(), pos(), pos(), named(3)], false).unwrap_or_else(|| panic!("fits"));
         assert_eq!(to, [To::Param(0), To::Param(1), To::Rest, To::Param(3)]);
         // The rest parameter's bit is set when it received an argument.
         assert_eq!(mask, 0b1111);
         // A default may be omitted; a required parameter may not.
-        assert!(arrange(&ps, &[pos()]).is_some());
-        assert!(arrange(&ps, &[named(3)]).is_none());
+        assert!(arrange(&ps, &[pos()], false).is_some());
+        assert!(arrange(&ps, &[named(3)], false).is_none());
         // An unknown name goes to the rest map when there is no named rest.
-        let (to, _) = arrange(&ps, &[pos(), named(9)]).unwrap_or_else(|| panic!("fits"));
+        let (to, _) = arrange(&ps, &[pos(), named(9)], false).unwrap_or_else(|| panic!("fits"));
         assert_eq!(to, [To::Param(0), To::RestNamedInRest(sym(9))]);
     }
 
@@ -846,17 +913,20 @@ mod tests {
             param(1, ParamKind::PositionalOnly, true),
         ];
         // A positional argument after a named one.
-        assert!(arrange(&ps, &[named(0), pos()]).is_none());
+        assert!(arrange(&ps, &[named(0), pos()], false).is_none());
         // A positional-only parameter cannot be named.
-        assert!(arrange(&ps, &[pos(), named(1)]).is_none());
+        assert!(arrange(&ps, &[pos(), named(1)], false).is_none());
         // Too many positionals without a rest.
-        assert!(arrange(&ps, &[pos(), pos(), pos()]).is_none());
+        assert!(arrange(&ps, &[pos(), pos(), pos()], false).is_none());
+        // PHP drops the extras.
+        let (to, _) = arrange(&ps, &[pos(), pos(), pos()], true).unwrap_or_else(|| panic!("fits"));
+        assert_eq!(to, [To::Param(0), To::Param(1), To::Ignore]);
         let spread = Arg {
             kind: ArgKind::Spread,
             ..pos()
         };
-        assert!(arrange(&ps, &[spread]).is_none());
+        assert!(arrange(&ps, &[spread], true).is_none());
         let empty: Vec<Arg> = Vec::new();
-        assert!(arrange(&[], &empty).is_some());
+        assert!(arrange(&[], &empty, false).is_some());
     }
 }

@@ -18,10 +18,10 @@
 
 <div align="left">
     <p>
-        <strong>bcgen-lang</strong> compiles HIR, the representation every LexerSketch language lowers into, to LSB, the bytecode <a href="https://crates.io/crates/bvm-lang"><code>bvm-lang</code></a> executes. Hand it a resolved unit and it returns an LSB module, ready to load: functions with defaults, named, variadic, and by-reference parameters, each carrying its LSB parameter list; closures; generators, <code>await</code>, and <code>spawn</code>; loops, <code>match</code>, and exceptions with <code>finally</code>; PHP arrays and references; and every OPS operation under the policy the language chose. It is what lets a forged language run the moment it is forged.
+        <strong>bcgen-lang</strong> compiles HIR, the representation every LexerSketch language lowers into, to LSB, the bytecode <a href="https://crates.io/crates/bvm-lang"><code>bvm-lang</code></a> executes. Hand it a resolved unit and it returns an LSB module, ready to load: functions with defaults, named, variadic, and by-reference parameters, each carrying its LSB parameter list; closures; generators, <code>await</code>, and <code>spawn</code>; loops, <code>match</code>, and exceptions with <code>finally</code>; PHP arrays and references; classes, interfaces, and mixins; and every OPS operation under the policy the language chose. It is what lets a forged language run the moment it is forged.
     </p>
     <p>
-        Version 0.3 compiles HIR spec v3 (hir-lang 0.4) to LSB format 2 (bytecode-lang 0.3, which bvm-lang 2.0.0-alpha.3 runs) in the <strong>dynamic profile</strong>: every value is an LSB <code>dyn</code>, the profile Mox and other dynamic languages run under. Operators a language defines itself (PHP's loose <code>==</code>, <code>.</code>, <code>**</code>) compile through an <strong>intrinsic table</strong>: an inline LSB fast path where LSB's result is exactly the language's, a host function the embedder provides everywhere else; <code>Intrinsics::mox()</code> covers every Mox intrinsic. Every instruction maps back to the HIR node it came from, so runtime errors point at source. Typed fast paths (from typeck-lang), classes, and declared records arrive in 0.5; until then those forms are precise <code>Unsupported</code> errors, never silent miscompilations.
+        Version 0.4 compiles HIR spec v3 (hir-lang 0.4) to LSB format 2 (bytecode-lang 0.3, which bvm-lang 2.0.0-alpha.4 runs) in the <strong>dynamic profile</strong>: every value is an LSB <code>dyn</code>, the profile Mox and other dynamic languages run under. <strong>Classes</strong> (new in 0.4) compile to LSB structs with PHP 8's semantics: inheritance, interfaces, mixins (PHP traits), constructors, properties, instance and static methods, <code>self::</code>/<code>parent::</code>/<code>static::</code>, static properties, constants, <code>new</code>/<code>instanceof</code>/<code>clone</code>, visibility raised with PHP's messages, exceptions caught by class, and destructors. Operators a language defines itself (PHP's loose <code>==</code>, <code>.</code>, <code>**</code>) compile through an <strong>intrinsic table</strong>: an inline LSB fast path where LSB's result is exactly the language's, a host function the embedder provides everywhere else; <code>Intrinsics::mox()</code> covers every Mox intrinsic. Every instruction maps back to the HIR node it came from, so runtime errors point at source. Typed fast paths (from typeck-lang) and declared records arrive in 0.5; until then those forms, and the class forms HIR or LSB cannot express, are precise <code>Unsupported</code> errors, never silent miscompilations.
     </p>
     <br>
     <hr>
@@ -49,7 +49,7 @@ What it guarantees, and how each guarantee is checked:
 
 | Guarantee | How it is held |
 |---|---|
-| Compiled programs mean what the HIR means. | `tests/differential.rs`: random well-formed programs (functions, closures, loops, `match`, `try`/`finally`, `defer`, maps, `let_place`, union type tests, every op under random policies, `promote`, `pow`, and saturating shifts included) run on bvm-lang and on a reference HIR interpreter written in the tests; results, printed output, error kinds, and error locations (the raising HIR node) must agree, under both array profiles. 1,320,000 programs were run before this release; every `cargo test` runs 3,000 more. |
+| Compiled programs mean what the HIR means. | `tests/differential.rs`: random well-formed programs (functions, closures, loops, `match`, `try`/`finally`, `defer`, maps, `let_place`, union type tests, every op under random policies, `promote`, `pow`, and saturating shifts included) run on bvm-lang and on a reference HIR interpreter written in the tests; results, printed output, error kinds, and error locations (the raising HIR node) must agree, under both array profiles, and again with the reference-counting clearing of `Options::with_reference_counting` (no result may change). 1,320,000 programs were run before 0.3.0 and 1,020,000 more, with the clearing profile, before 0.4.0; every `cargo test` runs 3,000 more. |
 | The forms the generator does not reach run as PHP runs them. | `tests/features_0_3.rs`: generators (keys, sends, `yield from` with throws, closing with `finally`, by-reference parameters), `await` and `spawn` on bvm-lang's scheduler, `let_place`, references into elements, OPS v2, `NoMatch`, unions, dynamic calls with named arguments and spreads, each checked against PHP's result. |
 | Calls bind the same whichever path they take. | `tests/binding.rs`: random parameter lists and argument lists (positional, named, unknown names, spreads, named spreads); the compile-time arrangement of a direct call and the VM's binding of the same call through the function's value give the same parameters or the same `ArgumentError`. |
 | Every Mox intrinsic computes PHP's result. | `tests/intrinsics.rs`: every mapping of `Intrinsics::mox()` runs against a test host implementing PHP 8's semantics, over every pair of a 37-value scalar pool; each fast path gives exactly the host's result on its documented domain and calls the host exactly for the operands outside it. |
@@ -59,7 +59,11 @@ What it guarantees, and how each guarantee is checked:
 | No recursion over the input. | Code generation is an explicit task stack: 100,000 nested operations, 20,000 nested `if`s inside 20,000 blocks, and 20,000 nested `let_place`s and union-of-intersection types compile on a 512 KiB stack in a debug build (`tests/limits.rs`, `tests/hostile.rs`). Output is bounded by an instruction budget. |
 | Hostile HIR never panics the compiler. | `tests/hostile.rs`: random HIR mixing every form anywhere (generators, `let_place`, references, intrinsics of any name and arity), repaired by `finish_lenient`; compiling either succeeds, and the module loads and runs under budgets, or returns a precise error. 200,000 programs before this release; 2,000 per `cargo test`. |
 | PHP array semantics. | Arrays are values (copied on assignment, passing, returning, capture, and store, with an O(1) copy-on-write `dup`), nested writes separate shared arrays and create missing ones, and keys follow PHP's coercion, checked against a reference interpreter that makes real deep copies, and by `tests/keys.rs` against PHP's canonical-integer rule. |
-| A Mox program runs end to end. | `tests/e2e.rs`: a hand-lowered Mox program (names unresolved, as a lowering emits them) is resolved by a lexical resolver in the test, compiled, and run on bvm-lang, printing through a host function. (resolve-lang 0.3 is on hir-lang 0.3; it returns to this test when it moves to 0.4.) |
+| A Mox program runs end to end. | `tests/e2e.rs`: a hand-lowered Mox program (names unresolved, as a lowering emits them) is resolved by resolve-lang 0.4's PHP policy, compiled, and run on bvm-lang, printing through a host function. |
+| Classes run as PHP runs them. | `tests/classes.rs`: 15 class programs end to end through resolve-lang 0.4 and bvm-lang 2.0.0-alpha.4, each against PHP's output: inheritance and overriding, interfaces, statics and constants, late static binding, mixins, exceptions by class and interface, visibility messages, members by run-time name, and destructor order under reference counting. |
+| Dispatch and visibility are PHP's. | `tests/class_model.rs`: random hierarchies of up to 12 classes with members of every visibility; every method call and property read, from every scope, against a model transcribed from PHP 8's `zend_std_get_method` and `zend_get_property_offset`. 5,000 hierarchies before this release; 300 per `cargo test`. |
+| Mixins flatten as PHP's traits do. | `tests/mixins.rs`: random mixin graphs with aliases, `insteadof`, and visibility rules, against a model of PHP's `zend_traits_copy_functions`. 5,000 graphs before this release; 400 per `cargo test`. |
+| Hostile class graphs never panic. | `tests/hostile_classes.rs`: random class graphs (cycles, deep chains, huge member counts, wrong kinds, malformed paths) compile or fail precisely, and run under budgets in both memory profiles. 50,000 before this release; 2,000 per `cargo test`. Chains deeper than bvm-lang's 256 are `ClassProblem::TooDeep`; huge classes hit the instruction budget (`tests/limits.rs`). |
 
 <hr>
 <br>
@@ -68,14 +72,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-bcgen-lang = "0.3"
+bcgen-lang = "0.4"
 ```
 
 Without the standard library:
 
 ```toml
 [dependencies]
-bcgen-lang = { version = "0.3", default-features = false }
+bcgen-lang = { version = "0.4", default-features = false }
 ```
 
 <hr>
@@ -182,9 +186,15 @@ assert_eq!(vm.str_bytes(v), Some(&b"ab"[..]));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+Classes compile from HIR's class items; `examples/classes.rs` builds two
+classes, compiles them with `Intrinsics::mox()` (whose `mox.new` is a class
+operation), and runs them, ending in a visibility error with PHP's message
+(`cargo run --example classes`).
+
 The full reference, including the calling convention, the dynamic semantics
-of every form, every Mox intrinsic's semantics, and what each option changes,
-is in [`docs/API.md`](./docs/API.md).
+of every form, the class model and the PHP class semantics covered and
+refused, every Mox intrinsic's semantics, and what each option changes, is in
+[`docs/API.md`](./docs/API.md).
 
 <hr>
 <br>
@@ -193,32 +203,43 @@ is in [`docs/API.md`](./docs/API.md).
 
 Release build on the development machine (Windows 11), criterion medians from
 `benches/bench.rs`. Compile figures are library-only (HIR in memory to an LSB
-module, no encoding); run figures are bvm-lang 2.0.0-alpha.3 executing the
-compiled module (VM instance creation included). The 0.2 column is bcgen-lang
-0.2.0 on bvm-lang 2.0.0-alpha.1, measured on the same machine the same day.
-Medians move by up to about 10% between runs on this machine; differences
-below that are noise.
+module, no encoding); run figures are bvm-lang executing the compiled module
+(VM instance creation included): 0.4.0 on bvm-lang 2.0.0-alpha.4, 0.3.0 on
+2.0.0-alpha.3 (the figures published with 0.3.0, same machine). Medians move
+by up to about 10% between runs on this machine; differences below that are
+noise.
 
-| Benchmark | 0.3.0 | 0.2.0 |
+| Benchmark | 0.4.0 | 0.3.0 |
 |---|---|---|
-| Compile, synthetic unit, 152k HIR nodes | 28 ms | 27 to 32 ms |
-| Compile, synthetic unit, 532k HIR nodes | 110 to 117 ms | 108 to 117 ms |
-| Compile, synthetic unit, 1.52M HIR nodes | 335 to 352 ms | 331 to 333 ms |
-| `fib(25)`, direct calls | 6.6 to 7.3 ms | 6.7 to 7.0 ms |
-| Counting loop, 1M iterations | 9.5 ms | 9.4 ms |
-| PHP array: 100k appends, then 100k indexed reads | 10.6 ms | 10.3 ms |
-| The same plus 100k nested writes `g[i % 64][] = i` | 23 to 29 ms | 415 ms |
-| A generator yielding 100k values, summed through `iter`/`iter_next` | 29 ms | (not compiled) |
-| 100k `let_place p = a[i % 64] in p = p + i` | 7.3 to 9.7 ms | (not compiled) |
-| 100k dynamic calls with two named arguments and a default | 15 to 22 ms | (packets) |
-| 100k `inc(&a[i % 64])` (a reference to an element) | 8.8 ms | (not compiled) |
-| 1M `mox.loose_eq(i, i)` (the inline fast path) | 54 to 57 ms | (host only) |
+| Compile, synthetic unit, 152k HIR nodes | 28 ms | 28 ms |
+| Compile, synthetic unit, 532k HIR nodes | 101 ms | 110 to 117 ms |
+| Compile, synthetic unit, 1.52M HIR nodes | 290 ms | 335 to 352 ms |
+| Compile, 1,000 classes (6 properties, 6 methods each), 104k HIR nodes | 56 to 64 ms | (not compiled) |
+| Compile, 4,000 classes, 416k HIR nodes | 248 to 276 ms | (not compiled) |
+| Compile, 1,000 classes all redeclaring 6 protected properties, 104k nodes | 70 to 72 ms | (not compiled) |
+| `fib(25)`, direct calls | 7.1 ms | 6.6 to 7.3 ms |
+| Counting loop, 1M iterations | 9.7 ms | 9.5 ms |
+| PHP array: 100k appends, then 100k indexed reads | 10.8 ms | 10.6 ms |
+| The same plus 100k nested writes `g[i % 64][] = i` | 25 ms | 23 to 29 ms |
+| A generator yielding 100k values, summed through `iter`/`iter_next` | 33 ms | 29 ms |
+| 100k `let_place p = a[i % 64] in p = p + i` | 8.5 ms | 7.3 to 9.7 ms |
+| 100k dynamic calls with two named arguments and a default | 12 ms | 15 to 22 ms |
+| 100k `inc(&a[i % 64])` (a reference to an element) | 11 ms | 8.8 ms |
+| 1M `mox.loose_eq(i, i)` (the inline fast path) | 60 ms | 54 to 57 ms |
+| 1M `$p->inc()` (`$this->n = $this->n + 1`) | 121 to 139 ms | (not compiled) |
+| 1M calls of a method inherited 8 levels up | 114 to 145 ms | (not compiled) |
+| 100k `new Pt($i, $i)` (a constructor setting two properties) | 14 to 17 ms | (not compiled) |
 
 "Nodes" counts items, expressions, statements, patterns, paths, and
-parameters. Compile time is linear: `tests/scaling.rs` measures 134 to 178 ns
-per node from 146k to 2.3M nodes. Nested writes are 15 to 18 times faster
-than 0.2's: `dsep_index` (LSB format 2) copies an inner array only when
-another array may share it, where 0.2 had to copy it on every write.
+parameters. Compile time is linear: `tests/scaling.rs` measures it per node
+from 146k to 2.3M nodes. Class units compile at about 1.6M nodes per second,
+and a name that every class redeclares with a non-public visibility stays
+linear too: each method's visibility plan covers its own class's lineage,
+and other objects share one check per name. A loop iteration with a method call
+costs about 13 times one of the counting loop: `has_prop`, `get_prop`
+through the method table, and a dynamic call that binds by the callee's
+parameter list. Ranges in the 0.4.0 column span the runs made for this
+release.
 
 <hr>
 <br>

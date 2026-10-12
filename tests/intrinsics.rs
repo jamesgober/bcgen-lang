@@ -236,13 +236,7 @@ mod php {
             P::Null | P::Bool(false) => 0,
             P::Bool(true) => 1,
             P::Int(i) => *i,
-            P::Float(f) => {
-                if f.is_finite() && *f > -9.3e18 && *f < 9.3e18 {
-                    *f as i64
-                } else {
-                    0
-                }
-            }
+            P::Float(f) => dval_to_lval(*f),
             P::Str(s) => {
                 // The leading numeric prefix.
                 let t = String::from_utf8_lossy(s).trim_start().to_string();
@@ -264,7 +258,7 @@ mod php {
                     if let Some(n) = numeric(&b[..cut]) {
                         return match n {
                             Num::I(i) => i,
-                            Num::F(f) => to_int(&P::Float(f)),
+                            Num::F(f) => dval_to_lval_cap(f),
                         };
                     }
                     cut -= 1;
@@ -273,6 +267,38 @@ mod php {
             }
             P::Arr(a) => i64::from(!a.is_empty()),
         }
+    }
+
+    /// PHP 7/8's `zend_dval_to_lval` on 64-bit platforms, transcribed from
+    /// `Zend/zend_operators.{h,c}` with its own float arithmetic (an
+    /// independent model of the inline bit computation): NaN and the
+    /// infinities are 0, `[-2^63, 2^63)` truncates, anything else is taken
+    /// modulo 2^64 (`fmod`, then into the signed range).
+    pub fn dval_to_lval(d: f64) -> i64 {
+        const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+        const TWO_64: f64 = 18_446_744_073_709_551_616.0;
+        if !d.is_finite() {
+            return 0;
+        }
+        if (-TWO_63..TWO_63).contains(&d) {
+            return d as i64;
+        }
+        // `zend_dval_to_lval_slow`: every step is exact (|d| >= 2^63 makes
+        // `d` a multiple of 2^11).
+        let mut dmod = d % TWO_64;
+        if dmod < 0.0 {
+            dmod += TWO_64;
+        }
+        if dmod >= TWO_63 {
+            dmod -= TWO_64;
+        }
+        dmod as i64
+    }
+
+    /// `zend_dval_to_lval_cap`: what a numeric string's float part becomes
+    /// (out of range saturates).
+    pub fn dval_to_lval_cap(d: f64) -> i64 {
+        if d.is_nan() { 0 } else { d as i64 }
     }
 
     fn arith_num(v: &P) -> Result<Num, ErrorKind> {
@@ -601,7 +627,7 @@ fn in_domain(f: Fast, args: &[P]) -> bool {
         }
         Fast::NumIdentity => matches!(a, Int(_) | Float(_)),
         Fast::IntBitNot => matches!(a, Int(_)),
-        Fast::ToInt => matches!(a, Int(_) | Bool(_) | Null),
+        Fast::ToInt => matches!(a, Int(_) | Float(_) | Bool(_) | Null),
         Fast::ToFloat => matches!(a, Float(_) | Int(_) | Bool(_) | Null),
         Fast::ToStr => matches!(a, Str(_)),
         Fast::ToBool => scalar4(a),
@@ -625,8 +651,14 @@ fn pool() -> Vec<P> {
         0.5,
         1e300,
         f64::INFINITY,
+        f64::NEG_INFINITY,
         f64::NAN,
         9007199254740993.0,
+        1e19,
+        -1e19,
+        9_223_372_036_854_775_808.0,
+        -9_223_372_036_854_775_808.0,
+        18_446_744_073_709_551_616.0,
     ] {
         v.push(P::Float(f));
     }
@@ -813,6 +845,68 @@ fn php_results_through_the_mox_mapping() {
     assert_eq!(got, vec![RV::Error(ErrorKind::DivByZero.code())]);
     let (got, _) = evaluate("shl", &[vec![P::Int(1), P::Int(-1)]]);
     assert_eq!(got, vec![RV::Error(ErrorKind::ShiftOutOfRange.code())]);
+}
+
+/// ISSUES P41: `(int)` of a float is PHP 7/8's `zend_dval_to_lval` on
+/// 64-bit platforms, inline: truncation in range, 0 for NaN and the
+/// infinities, modulo 2^64 outside. Expected values are PHP's (and the
+/// independent `fmod` transcription agrees on each).
+#[test]
+fn float_to_int_wraps_modulo_two_to_the_64_like_php() {
+    const VECTORS: [(f64, i64); 22] = [
+        (0.0, 0),
+        (-0.0, 0),
+        (1.9, 1),
+        (-1.9, -1),
+        (9_007_199_254_740_993.0, 9_007_199_254_740_992),
+        (9_223_372_036_854_774_784.0, 9_223_372_036_854_774_784),
+        (-9_223_372_036_854_775_808.0, i64::MIN),
+        (9_223_372_036_854_775_808.0, i64::MIN),
+        (9_223_372_036_854_777_856.0, -9_223_372_036_854_773_760),
+        (-9_223_372_036_854_777_856.0, 9_223_372_036_854_773_760),
+        (1e19, -8_446_744_073_709_551_616),
+        (-1e19, 8_446_744_073_709_551_616),
+        (1.5e19, -3_446_744_073_709_551_616),
+        (18_446_744_073_709_551_616.0, 0),
+        (18_446_744_073_709_555_712.0, 4096),
+        (-18_446_744_073_709_555_712.0, -4096),
+        (1e20, 7_766_279_631_452_241_920),
+        (-1e20, -7_766_279_631_452_241_920),
+        (1e300, 0),
+        (f64::INFINITY, 0),
+        (f64::NEG_INFINITY, 0),
+        (f64::NAN, 0),
+    ];
+    let cases: Vec<Vec<P>> = VECTORS.iter().map(|&(f, _)| vec![P::Float(f)]).collect();
+    let (got, calls) = evaluate("cast_int", &cases);
+    for ((f, want), g) in VECTORS.iter().zip(&got) {
+        assert_eq!(*g, RV::Int(*want), "(int){f:e}");
+        assert_eq!(php::dval_to_lval(*f), *want, "model (int){f:e}");
+    }
+    // All inline: the host is never called for a float.
+    let called = calls
+        .lock()
+        .map(|c| c.get("cast_int").copied().unwrap_or(0))
+        .unwrap_or(0);
+    assert_eq!(called, 0);
+}
+
+/// Random floats over the whole bit space against the `fmod` model.
+#[test]
+fn float_to_int_matches_the_model_on_random_bits() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut cases: Vec<Vec<P>> = Vec::new();
+    for _ in 0..4_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        cases.push(vec![P::Float(f64::from_bits(x))]);
+    }
+    let (got, _) = evaluate("cast_int", &cases);
+    for (c, g) in cases.iter().zip(&got) {
+        let P::Float(f) = c[0] else { unreachable!() };
+        assert_eq!(*g, RV::Int(php::dval_to_lval(f)), "(int){f:e}");
+    }
 }
 
 #[test]

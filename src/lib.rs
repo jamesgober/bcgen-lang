@@ -56,8 +56,18 @@
 //! inline fast path or a host function). Every instruction maps back to the
 //! HIR node it came from ([`Compiled::origin`]) and to a line-table row.
 //!
-//! Not yet: classes, declared records and sums, and typed fast paths (0.5);
-//! each is a precise [`CompileError::Unsupported`].
+//! Classes (0.4): classes, interfaces, and mixins (PHP traits) compile to LSB
+//! structs with PHP's semantics: single inheritance, constructors,
+//! properties with defaults, instance and static methods, `self::`,
+//! `parent::`, and late-bound `static::`, static properties, constants,
+//! `new`/`instanceof`/`clone` as [`ClassOp`]s of the intrinsic table,
+//! visibility checked where PHP checks it (raised as `TypeError` with PHP's
+//! message), objects thrown and caught by class or interface, and the
+//! destructor's name for the VM ([`Compiled::destructor`]).
+//!
+//! Not yet: declared records and sums, and typed fast paths (0.5); each is a
+//! precise [`CompileError::Unsupported`], as is every class form HIR or LSB
+//! cannot express (multiple inheritance, `impl` blocks).
 //!
 //! ## Guarantees
 //!
@@ -93,16 +103,18 @@
 extern crate alloc;
 
 mod analysis;
+mod class;
 mod codegen;
 mod error;
 mod func;
 mod intrinsics;
+mod members;
 mod options;
 mod output;
 mod unit;
 
-pub use error::{CompileError, Unsupported};
-pub use intrinsics::{Arity, Fast, IntrinsicDef, Intrinsics, Lowering, LsbOp};
+pub use error::{ClassProblem, CompileError, Unsupported};
+pub use intrinsics::{Arity, ClassOp, Fast, IntrinsicDef, Intrinsics, Lowering, LsbOp};
 pub use options::{ArraySemantics, BodyMode, KeyCoercion, LineIndex, Locate, Location, Options};
 pub use output::Compiled;
 
@@ -112,7 +124,7 @@ pub use output::Compiled;
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 #[doc = include_str!("../docs/API.md")]
-#[doc = include_str!("../docs/release/v0.3.0.md")]
+#[doc = include_str!("../docs/release/v0.4.0.md")]
 pub struct MarkdownDocTests;
 
 use hir_lang::Hir;

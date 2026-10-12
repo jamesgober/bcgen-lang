@@ -13,6 +13,9 @@ fn run(seed: u64) {
     let (hir, names) = progs::program(seed);
     let _ = check(&hir, &names, Profile::PHP);
     let _ = check(&hir, &names, Profile::REFERENCE);
+    // Code for a reference-counting VM clears dead registers: no result
+    // may change.
+    let _ = check(&hir, &names, Profile::PHP_CLEAR);
 }
 
 proptest! {

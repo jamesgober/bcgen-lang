@@ -7,6 +7,11 @@ use alloc::vec::Vec;
 use bytecode_lang::{FunctionBuilder, Inst, Label, Reg, ValType};
 use hir_lang::{BinderId, ExprId, NodeRef};
 
+/// Whether a register of this type can keep a heap object alive.
+fn holds_refs(ty: ValType) -> bool {
+    matches!(ty, ValType::Dyn | ValType::Str | ValType::Ref(_))
+}
+
 /// A jump target: a loop, or a labeled block.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Target {
@@ -101,6 +106,12 @@ pub(crate) struct FnCx {
     pub(crate) fins: Vec<Fin>,
     pub(crate) tries: Vec<TryState>,
     pub(crate) next_target: u32,
+    /// Clear registers holding references when they die (see
+    /// [`Options::with_reference_counting`](crate::Options::with_reference_counting)).
+    pub(crate) clear: bool,
+    /// The last instruction ended a block (a jump, return, throw): code
+    /// here is unreachable until a label is bound, so nothing is cleared.
+    pub(crate) dead: bool,
 }
 
 impl FnCx {
@@ -122,12 +133,24 @@ impl FnCx {
             fins: Vec::new(),
             tries: Vec::new(),
             next_target: 0,
+            clear: false,
+            dead: false,
         }
     }
 
     /// Emits one instruction, attributed to the current node.
     pub(crate) fn emit(&mut self, inst: Inst) -> u32 {
         self.origins.push(self.node);
+        self.dead = matches!(
+            inst,
+            Inst::Ret { .. }
+                | Inst::RetVoid { .. }
+                | Inst::Throw { .. }
+                | Inst::Raise { .. }
+                | Inst::Unreachable { .. }
+                | Inst::TailCall { .. }
+                | Inst::TailCallIndirect { .. }
+        );
         self.f.emit(inst)
     }
 
@@ -165,6 +188,9 @@ impl FnCx {
             }
             *l = false;
         }
+        if self.clear && !self.dead && holds_refs(ty) {
+            let _ = self.emit(Inst::LoadNil { dst: r });
+        }
         self.free.entry(ty).or_default().push(r);
     }
 
@@ -197,6 +223,22 @@ impl FnCx {
 
     /// Returns a window to its shape's pool.
     pub(crate) fn release_window(&mut self, shape: u32, base: Reg) {
+        if self.clear && !self.dead {
+            let n = self.shapes.get(shape as usize).map_or(0, Vec::len);
+            for i in 0..n {
+                let ty = self
+                    .shapes
+                    .get(shape as usize)
+                    .and_then(|s| s.get(i))
+                    .copied()
+                    .unwrap_or(ValType::Bool);
+                if holds_refs(ty) {
+                    let _ = self.emit(Inst::LoadNil {
+                        dst: Self::slot(base, i),
+                    });
+                }
+            }
+        }
         if let Some(w) = self.windows.get_mut(shape as usize) {
             debug_assert!(!w.contains(&base), "window {base} released twice");
             w.push(base);

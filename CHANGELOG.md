@@ -13,6 +13,89 @@
 
 ---
 
+## [0.4.0] - 2026-10-12
+
+**Classes.** HIR's classes, interfaces, and mixins (PHP traits) compile to
+LSB structs (LSB §3.1) with PHP 8's semantics, pulled forward from the 0.5
+plan because Mox needs them for the LexerSketch Demo. Also: PHP's ignored
+extra arguments, Mox's `(int)` of an out-of-range float, string offsets
+through a named intrinsic, and resolve-lang back in the end-to-end tests.
+Executes on bvm-lang `=2.0.0-alpha.4`.
+
+### Breaking
+
+- **Classes compile.** A unit with class, interface, or mixin items, receiver
+  parameters, member paths, `new`, `instanceof`, or `clone` no longer fails
+  with `Unsupported::Class`; `Unsupported::Class` now means only a receiver
+  parameter outside a class or mixin member.
+- **`Intrinsics::mox()`**: `mox.instanceof` and `mox.clone` are class
+  operations (`Lowering::Class`, inline for the unit's classes, the host
+  function only for other values; 0.3: host functions); `mox.new` (class
+  operation) and `mox.str_offset` (fast path) are added; 43 entries.
+- **Mox `(int)` of a finite float outside the `i64` range wraps modulo 2^64**
+  like PHP 8's `zend_dval_to_lval` (NaN and infinities give 0); 0.3
+  saturated (`Fast::ToInt`, ISSUES P41).
+- **Dev-dependencies**: bvm-lang `=2.0.0-alpha.4`; resolve-lang `0.4`.
+
+### Added
+
+- **Classes** (`docs/API.md`, "Classes, interfaces, and mixins"): one LSB
+  struct per class and interface; single inheritance up to bvm-lang's 256
+  levels; instance properties with defaults (a private property is a slot
+  per declaring class); instance and static methods (the receiver, or the
+  class's token, in register 0); `self::`, `parent::`, and late-bound
+  `static::` through the receiver; static properties (a reference per
+  declaring class, shared by subclasses) and class constants (literal or
+  computed in the class's scope at load); interfaces as marker methods, with
+  their constants; mixins flattened per using class by PHP's
+  `zend_traits_copy_functions` (aliases, `insteadof`, visibility changes,
+  mixin properties, statics, and constants).
+- **`new`, `instanceof`, `clone`** as class operations of the intrinsic table
+  (`ClassOp`, `Intrinsics::with_class`, `Lowering::Class`): constructors found
+  up the chain and called directly, class values known only at run time
+  through a name registry, `__clone`, `C::class`/`static::class`, and the host
+  function for anything the unit does not declare.
+- **Visibility** checked where PHP checks it (compile time for static paths,
+  per-scope run-time plans through objects), each violation a `TypeError`
+  (E0100) with PHP's message; members a class does not have raise PHP's
+  "undefined" errors where the access runs.
+- **Exceptions as objects**: `catch` by class, interface, union, or
+  intersection; non-objects still throw and catch as before.
+- **Destructors**: `Compiled::destructor()` names the destructor method
+  (`__destruct()`) for bvm-lang's `Vm::set_destructor`;
+  `Options::with_reference_counting` clears dead temporaries so objects die
+  where PHP frees them under `Memory::Rc`.
+- **Members by run-time name**: `$o->$name` reads and writes and `$o->$m()`
+  calls, through a per-scope dispatch function.
+- `Options::with_constructor`, `with_destructor`, `with_clone_method`,
+  `with_reference_counting`, `with_ignore_extra`, `with_string_offsets`, and
+  their getters; `Compiled::class_type`, `Compiled::method`,
+  `Compiled::destructor`; `ClassOp`; `ClassProblem`;
+  `CompileError::Class` and `CompileError::InvalidOption`;
+  `Unsupported::Impl`, `MultipleInheritance`, `ClassValue`, `MixinMember`,
+  `ClassTest`, `AmbiguousClass`, `StaticRef`; `Fast::StrOffset`.
+- **`ignore_extra`** (ISSUES P34): `Options::with_ignore_extra(true)` gives
+  every parameter list LSB's `ignore_extra`, so extra arguments to user
+  functions are dropped as PHP drops them; direct calls arranged at compile
+  time follow the same rule.
+- **String offsets through an intrinsic** (ISSUES P38):
+  `Options::with_string_offsets("mox.str_offset")` routes indexed reads of a
+  string through the table entry (a fast path returns the one-byte string for
+  an in-range offset, negative offsets from the end) instead of LSB's byte
+  read.
+- `tests/classes.rs` (15 programs end to end, resolved by resolve-lang 0.4),
+  `tests/class_model.rs` (dispatch and visibility against a model of PHP 8's
+  lookups), `tests/mixins.rs` (flattening against a model of PHP's trait
+  copying), `tests/hostile_classes.rs` (random class graphs never panic),
+  `tests/features_0_4.rs`, `examples/classes.rs`, class benchmarks.
+
+### Changed
+
+- `tests/e2e.rs` resolves its Mox program with resolve-lang 0.4 again
+  (ISSUES P35), not a resolver written in the test.
+
+---
+
 ## [0.3.0] - 2026-10-12
 
 HIR spec v3 (hir-lang 0.4) to **LSB format 2** (bytecode-lang 0.3), which
@@ -213,7 +296,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/bcgen-lang/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bcgen-lang/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/bcgen-lang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/bcgen-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/bcgen-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/bcgen-lang/releases/tag/v0.1.0

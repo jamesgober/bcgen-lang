@@ -3,7 +3,10 @@
 //! fib, a counting loop, map-heavy PHP-array code (nested writes separate
 //! with `dsep_index`), a generator, `let_place` compound updates, dynamic
 //! calls with named arguments, by-reference element arguments, and a Mox
-//! intrinsic's fast path.
+//! intrinsic's fast path. Since 0.4: compile throughput of class-heavy
+//! units (public members, and protected ones every class redeclares), and
+//! the run time of method calls (own, and inherited 8 deep), property
+//! reads and writes through `$this`, and `new` with a constructor.
 
 use std::hint::black_box;
 
@@ -675,5 +678,335 @@ fn run_time(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, compile_throughput, run_time);
+// ------------------------------------------------------------------ classes
+
+impl B {
+    /// The receiver parameter `$this`.
+    fn this_param(&mut self) -> (ParamId, BinderId) {
+        let n = Name::new(self.names.intern("this"));
+        let b = self.b.binder(Binder::new(n, BinderKind::Param));
+        let p = self.b.bind(b);
+        let mut param = Param::new(p);
+        param.kind = hir_lang::ParamKind::Receiver;
+        (self.b.param(param), b)
+    }
+
+    /// A public method (an instance method when `params` starts with the
+    /// receiver).
+    fn method(&mut self, name: &str, params: &[ParamId], body: ExprId) -> ItemId {
+        let n = Name::new(self.names.intern(name));
+        let params = self.b.list(params);
+        self.b.item(
+            Item::new(
+                Some(n),
+                ItemKind::Fn(FnDef {
+                    params,
+                    body: Some(body),
+                    effects: Effects::THROWS,
+                    ..FnDef::default()
+                }),
+            )
+            .with_vis(hir_lang::Vis::Public),
+        )
+    }
+
+    fn field(&mut self, base: ExprId, name: &str) -> ExprId {
+        let sym = self.names.intern(name);
+        self.b.expr(Expr::Field {
+            base,
+            member: hir_lang::Member::Named(sym),
+            span: Span::empty(0),
+        })
+    }
+
+    fn call_method(&mut self, receiver: ExprId, name: &str, args: &[ExprId]) -> ExprId {
+        let method = Ident::new(self.names.intern(name), Span::empty(0));
+        let args: Vec<Arg> = args.iter().map(|&a| Arg::positional(a)).collect();
+        let args = self.b.list(&args);
+        self.b.expr(Expr::MethodCall {
+            receiver,
+            method,
+            generic_args: hir_lang::List::EMPTY,
+            args,
+        })
+    }
+
+    fn class(
+        &mut self,
+        name: &str,
+        base: Option<(&str, ItemId)>,
+        fields: &[&str],
+        items: &[ItemId],
+    ) -> ItemId {
+        self.class_vis(name, base, fields, hir_lang::Vis::Public, items)
+    }
+
+    fn class_vis(
+        &mut self,
+        name: &str,
+        base: Option<(&str, ItemId)>,
+        fields: &[&str],
+        vis: hir_lang::Vis,
+        items: &[ItemId],
+    ) -> ItemId {
+        let bases = match base {
+            Some((bn, bi)) => {
+                let d = self.b.def(Def::Item(bi));
+                let seg = Segment::new(Name::new(self.names.intern(bn)), self.b.origin());
+                let segs = self.b.list(&[seg]);
+                let p = self.b.path(Path {
+                    res: Res::Def(d),
+                    ..Path::new(segs, Ns::Type)
+                });
+                let t = self.b.ty(hir_lang::Ty::Path(p));
+                self.b.list(&[t])
+            }
+            None => hir_lang::List::EMPTY,
+        };
+        let fs: Vec<hir_lang::FieldId> = fields
+            .iter()
+            .map(|f| {
+                let zero = self.b.int(0);
+                self.b.field(hir_lang::FieldDef {
+                    name: Some(Ident::new(self.names.intern(f), Span::empty(0))),
+                    vis,
+                    ty: None,
+                    default: Some(zero),
+                })
+            })
+            .collect();
+        let def = hir_lang::ClassDef {
+            bases,
+            fields: self.b.list(&fs),
+            items: self.b.list(items),
+            ..hir_lang::ClassDef::default()
+        };
+        let n = Name::new(self.names.intern(name));
+        self.b
+            .item(Item::new(Some(n), ItemKind::Class(def)).with_vis(hir_lang::Vis::Public))
+    }
+
+    /// `new C(args)` as Mox lowers it (the extern `mox.new`).
+    fn new_obj(&mut self, name: &str, class: ItemId, args: &[ExprId]) -> ExprId {
+        let sym = self.names.intern("mox.new");
+        let seg = Segment::new(Name::new(sym), self.b.origin());
+        let segs = self.b.list(&[seg]);
+        let p = self.b.path(Path {
+            res: Res::Extern(sym),
+            ..Path::new(segs, Ns::Value)
+        });
+        let callee = self.b.expr(Expr::Path(p));
+        let cname = Name::new(self.names.intern(name));
+        let cls = self.fn_ref(cname, class);
+        let mut all = vec![cls];
+        all.extend_from_slice(args);
+        self.b.call(callee, &all)
+    }
+}
+
+/// `class P { public $n = 0; function inc() { $this->n = $this->n + 1; } }`,
+/// then `$p = new P; for i in 0..n { $p->inc() }; $p->n`.
+fn method_calls(n: i64) -> (Hir, Interner) {
+    let mut s = B::new();
+    let (tp, this) = s.this_param();
+    let t = s.b.use_binder(this);
+    let cur = s.field(t, "n");
+    let one = s.b.int(1);
+    let sum = s.b.op(OpKind::Add, &[cur, one]);
+    let t = s.b.use_binder(this);
+    let target = s.field(t, "n");
+    let a = s.b.expr(Expr::Assign {
+        target,
+        op: None,
+        value: sum,
+    });
+    let body = s.b.block(&[], Some(a));
+    let inc = s.method("inc", &[tp], body);
+    let class = s.class("P", None, &["n"], &[inc]);
+    let p = s.local("p");
+    let o = s.new_obj("P", class, &[]);
+    let pp = s.b.bind(p);
+    let lp = s.b.let_stmt(pp, Some(o));
+    let nn = s.b.int(n);
+    let lo = s.counted(nn, |s, _| {
+        let vp = s.b.use_binder(p);
+        let c = s.call_method(vp, "inc", &[]);
+        vec![s.b.expr_stmt(c)]
+    });
+    let ls = s.b.expr_stmt(lo);
+    let vp = s.b.use_binder(p);
+    let r = s.field(vp, "n");
+    let body = s.b.block(&[lp, ls], Some(r));
+    s.module(&[class], Some(body))
+}
+
+/// An 8-deep chain with the method on the root: `for i in 0..n { $o->get() }`
+/// on an instance of the deepest class (LSB's method lookup walks up).
+fn inherited_calls(n: i64) -> (Hir, Interner) {
+    let mut s = B::new();
+    let (tp, this) = s.this_param();
+    let t = s.b.use_binder(this);
+    let r = s.field(t, "n");
+    let body = s.b.block(&[], Some(r));
+    let get = s.method("get", &[tp], body);
+    let mut prev = s.class("C0", None, &["n"], &[get]);
+    let mut items = vec![prev];
+    let mut name = String::from("C0");
+    for i in 1..8 {
+        let next = format!("C{i}");
+        prev = s.class(&next, Some((&name, prev)), &[], &[]);
+        items.push(prev);
+        name = next;
+    }
+    let o = s.local("o");
+    let obj = s.new_obj(&name, prev, &[]);
+    let po = s.b.bind(o);
+    let lo = s.b.let_stmt(po, Some(obj));
+    let nn = s.b.int(n);
+    let lp = s.counted(nn, |s, _| {
+        let vo = s.b.use_binder(o);
+        let c = s.call_method(vo, "get", &[]);
+        vec![s.b.expr_stmt(c)]
+    });
+    let ls = s.b.expr_stmt(lp);
+    let body = s.b.block(&[lo, ls], None);
+    s.module(&items, Some(body))
+}
+
+/// `class Pt { public $x; public $y; function __construct($x, $y) {..} }`,
+/// `for i in 0..n { $p = new Pt(i, i) }`.
+fn constructions(n: i64) -> (Hir, Interner) {
+    let mut s = B::new();
+    let (tp, this) = s.this_param();
+    let (px, xb) = s.param("x");
+    let (py, yb) = s.param("y");
+    let mut stmts = Vec::new();
+    for (f, b) in [("x", xb), ("y", yb)] {
+        let t = s.b.use_binder(this);
+        let target = s.field(t, f);
+        let v = s.b.use_binder(b);
+        let a = s.b.expr(Expr::Assign {
+            target,
+            op: None,
+            value: v,
+        });
+        stmts.push(s.b.expr_stmt(a));
+    }
+    let body = s.b.block(&stmts, None);
+    let ctor = s.method("__construct", &[tp, px, py], body);
+    let class = s.class("Pt", None, &["x", "y"], &[ctor]);
+    let p = s.local("p");
+    let z = s.b.int(0);
+    let pp = s.b.bind(p);
+    let lp = s.b.let_stmt(pp, Some(z));
+    let nn = s.b.int(n);
+    let lo = s.counted(nn, |s, i| {
+        let (a, b) = (s.b.use_binder(i), s.b.use_binder(i));
+        let o = s.new_obj("Pt", class, &[a, b]);
+        vec![s.assign(p, o)]
+    });
+    let ls = s.b.expr_stmt(lo);
+    let body = s.b.block(&[lp, ls], None);
+    s.module(&[class], Some(body))
+}
+
+/// A unit of `classes` classes in chains of 8, each with 6 properties (of
+/// visibility `vis`) and 6 methods reading them and calling each other.
+/// Every class redeclares the same names, the worst case for visibility
+/// plans when they are not public.
+fn synthetic_classes(classes: usize, vis: hir_lang::Vis) -> (Hir, Interner) {
+    let mut s = B::new();
+    let mut items = Vec::new();
+    let mut prev: Option<(String, ItemId)> = None;
+    for c in 0..classes {
+        let mut methods = Vec::new();
+        for m in 0..6 {
+            let (tp, this) = s.this_param();
+            let t = s.b.use_binder(this);
+            let a = s.field(t, &format!("p{m}"));
+            let t = s.b.use_binder(this);
+            let callee = format!("m{}", (m + 1) % 6);
+            let call = s.call_method(t, &callee, &[]);
+            let k = s.b.int(c as i64);
+            let sum = s.b.op(OpKind::Add, &[a, k]);
+            let cond = s.b.op(OpKind::Lt, &[sum, call]);
+            let x = s.b.int(1);
+            let y = s.b.int(2);
+            let ife = s.b.expr(Expr::If {
+                cond,
+                then: x,
+                else_: Some(y),
+            });
+            let body = s.b.block(&[], Some(ife));
+            methods.push(s.method(&format!("m{m}"), &[tp], body));
+        }
+        let fields: Vec<String> = (0..6).map(|f| format!("p{f}")).collect();
+        let frefs: Vec<&str> = fields.iter().map(String::as_str).collect();
+        let name = format!("K{c}");
+        let base = if c % 8 == 0 { None } else { prev.clone() };
+        let class = s.class_vis(
+            &name,
+            base.as_ref().map(|(n, i)| (n.as_str(), *i)),
+            &frefs,
+            vis,
+            &methods,
+        );
+        prev = Some((name, class));
+        items.push(class);
+    }
+    s.module(&items, None)
+}
+
+fn classes_compile(c: &mut Criterion) {
+    let mut g = c.benchmark_group("compile");
+    g.sample_size(10);
+    for (label, classes, vis) in [
+        ("class_nodes", 1_000usize, hir_lang::Vis::Public),
+        ("class_nodes", 4_000, hir_lang::Vis::Public),
+        ("class_nodes_protected", 1_000, hir_lang::Vis::Protected),
+    ] {
+        let (hir, names) = synthetic_classes(classes, vis);
+        if let Err(e) = bcgen_lang::compile(&hir, &names) {
+            panic!("{label}: {e}");
+        }
+        let n = nodes(&hir);
+        g.throughput(Throughput::Elements(n));
+        g.bench_with_input(BenchmarkId::new(label, n), &hir, |b, hir| {
+            b.iter(|| bcgen_lang::compile(black_box(hir), &names));
+        });
+    }
+    g.finish();
+}
+
+fn classes_run(c: &mut Criterion) {
+    let mut g = c.benchmark_group("run");
+    g.sample_size(10);
+    let cases: Vec<(&str, (Hir, Interner))> = vec![
+        ("method_call_1m", method_calls(1_000_000)),
+        ("inherited_method_8_deep_1m", inherited_calls(1_000_000)),
+        ("new_with_constructor_100k", constructions(100_000)),
+    ];
+    for (name, (hir, names)) in &cases {
+        let (program, entry) = load(hir, names);
+        // A class program that raises would measure the error path.
+        if let Err(e) = Vm::new(&program).run(entry, &[]) {
+            panic!("{name}: {e}");
+        }
+        g.bench_function(*name, |b| {
+            b.iter(|| {
+                let mut vm = Vm::new(&program);
+                black_box(vm.run(entry, &[]))
+            });
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    compile_throughput,
+    run_time,
+    classes_compile,
+    classes_run
+);
 criterion_main!(benches);

@@ -103,6 +103,12 @@ pub struct Options {
     hooks: Vec<(Hook, String, String)>,
     intrinsics: Intrinsics,
     max_instructions: u64,
+    ignore_extra: bool,
+    string_offsets: Option<String>,
+    constructor: Option<String>,
+    destructor: Option<String>,
+    clone_method: Option<String>,
+    reference_counting: bool,
 }
 
 impl Default for Options {
@@ -117,7 +123,9 @@ impl Options {
 
     /// The PHP profile: [`ArraySemantics::Php`], [`KeyCoercion::Php`],
     /// [`BodyMode::Start`], file name `<hir>`, host module `host`, no hooks,
-    /// and the built-in intrinsics ([`Intrinsics::core`]).
+    /// the built-in intrinsics ([`Intrinsics::core`]), extra arguments
+    /// refused, string offsets read as bytes, and PHP's magic method names
+    /// (`__construct`, `__destruct`, `__clone`).
     ///
     /// # Examples
     ///
@@ -138,6 +146,12 @@ impl Options {
             hooks: Vec::new(),
             intrinsics: Intrinsics::core(),
             max_instructions: Self::DEFAULT_MAX_INSTRUCTIONS,
+            ignore_extra: false,
+            string_offsets: None,
+            constructor: Some(String::from("__construct")),
+            destructor: Some(String::from("__destruct")),
+            clone_method: Some(String::from("__clone")),
+            reference_counting: false,
         }
     }
 
@@ -276,6 +290,134 @@ impl Options {
         self
     }
 
+    /// Whether user functions, closures, and methods ignore extra positional
+    /// arguments (PHP: `f(1, 2, 3)` of `function f($a)` drops the extras
+    /// after evaluating them) instead of raising `ArgumentError` (E0114,
+    /// Python's rule and the default). Sets LSB's `ignore_extra` on every
+    /// parameter list the module carries, and direct calls evaluate and
+    /// discard the extras. Named arguments that match no parameter are an
+    /// error either way.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bcgen_lang::Options;
+    ///
+    /// assert!(Options::new().with_ignore_extra(true).ignore_extra());
+    /// assert!(!Options::new().ignore_extra());
+    /// ```
+    #[must_use]
+    pub fn with_ignore_extra(mut self, ignore: bool) -> Self {
+        self.ignore_extra = ignore;
+        self
+    }
+
+    /// Routes **string-offset reads** (`$s[i]` where `$s` holds a string)
+    /// through the intrinsic `name` of the [intrinsic table](Self::intrinsics),
+    /// called with the string and the (coerced) key; every other indexed read
+    /// stays LSB's `dget_index`. Without it, a string offset reads LSB's
+    /// answer: the byte as an `int` (LSB §5.7). PHP gives a one-character
+    /// string, which [`Fast::StrOffset`](crate::Fast::StrOffset) computes
+    /// inline (`Intrinsics::mox()` maps `mox.str_offset` to it). The entry
+    /// must exist and take two operands, or compilation fails with
+    /// [`CompileError::InvalidOption`](crate::CompileError::InvalidOption).
+    /// String writes (`$s[0] = "x"`) are unchanged: LSB strings are
+    /// immutable, so they go to the `set_index` hook.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bcgen_lang::{Intrinsics, Options};
+    ///
+    /// let o = Options::new()
+    ///     .with_intrinsics(Intrinsics::mox())
+    ///     .with_string_offsets("mox.str_offset");
+    /// assert_eq!(o.string_offsets(), Some("mox.str_offset"));
+    /// ```
+    #[must_use]
+    pub fn with_string_offsets(mut self, name: &str) -> Self {
+        self.string_offsets = Some(String::from(name));
+        self
+    }
+
+    /// Names the constructor method `new` calls after initializing the
+    /// instance's properties (`None`: classes have no constructor, and `new`
+    /// evaluates and drops its arguments).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bcgen_lang::Options;
+    ///
+    /// assert_eq!(Options::new().constructor(), Some("__construct"));
+    /// assert_eq!(Options::new().with_constructor(Some("__init__")).constructor(), Some("__init__"));
+    /// ```
+    #[must_use]
+    pub fn with_constructor(mut self, name: Option<&str>) -> Self {
+        self.constructor = name.map(String::from);
+        self
+    }
+
+    /// Names the destructor method. bcgen-lang does not call it: LSB format
+    /// 2 has no destructor flag, so the host passes
+    /// [`Compiled::destructor`](crate::Compiled::destructor) to bvm-lang's
+    /// `Vm::set_destructor`. A class method of this name must take no
+    /// parameters ([`ClassProblem::BadDestructor`](crate::ClassProblem::BadDestructor)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bcgen_lang::Options;
+    ///
+    /// assert_eq!(Options::new().destructor(), Some("__destruct"));
+    /// assert_eq!(Options::new().with_destructor(None).destructor(), None);
+    /// ```
+    #[must_use]
+    pub fn with_destructor(mut self, name: Option<&str>) -> Self {
+        self.destructor = name.map(String::from);
+        self
+    }
+
+    /// Emits code for a VM that counts references (bvm-lang's
+    /// `Memory::Rc`, the language's `[runtime] memory = "rc"`), so objects
+    /// die where PHP frees them: every temporary register and call window
+    /// that may hold a reference is cleared (`load_nil`) when it dies, and a
+    /// variable keeps its register until the function returns (PHP
+    /// variables are function-scoped). Without it, a dead temporary keeps
+    /// its object alive until the register is reused, which delays
+    /// destructors. The cost is one `load_nil` per dying reference
+    /// register; nothing changes under a tracing collector.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bcgen_lang::Options;
+    ///
+    /// assert!(Options::new().with_reference_counting(true).reference_counting());
+    /// assert!(!Options::new().reference_counting());
+    /// ```
+    #[must_use]
+    pub fn with_reference_counting(mut self, rc: bool) -> Self {
+        self.reference_counting = rc;
+        self
+    }
+
+    /// Names the method a clone ([`ClassOp::Clone`](crate::ClassOp::Clone))
+    /// calls on the new copy (PHP's `__clone`), when the class has one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bcgen_lang::Options;
+    ///
+    /// assert_eq!(Options::new().clone_method(), Some("__clone"));
+    /// ```
+    #[must_use]
+    pub fn with_clone_method(mut self, name: Option<&str>) -> Self {
+        self.clone_method = name.map(String::from);
+        self
+    }
+
     /// The array semantics.
     ///
     /// # Examples
@@ -372,6 +514,73 @@ impl Options {
     #[must_use]
     pub fn max_instructions(&self) -> u64 {
         self.max_instructions
+    }
+
+    /// Whether extra positional arguments are ignored (see
+    /// [`with_ignore_extra`](Self::with_ignore_extra)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(!bcgen_lang::Options::new().ignore_extra());
+    /// ```
+    #[must_use]
+    pub fn ignore_extra(&self) -> bool {
+        self.ignore_extra
+    }
+
+    /// The intrinsic string-offset reads go through, if any (see
+    /// [`with_string_offsets`](Self::with_string_offsets)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bcgen_lang::Options::new().string_offsets(), None);
+    /// ```
+    #[must_use]
+    pub fn string_offsets(&self) -> Option<&str> {
+        self.string_offsets.as_deref()
+    }
+
+    /// The constructor method name.
+    ///
+    /// # Examples
+    ///
+    /// See [`with_constructor`](Self::with_constructor).
+    #[must_use]
+    pub fn constructor(&self) -> Option<&str> {
+        self.constructor.as_deref()
+    }
+
+    /// The destructor method name.
+    ///
+    /// # Examples
+    ///
+    /// See [`with_destructor`](Self::with_destructor).
+    #[must_use]
+    pub fn destructor(&self) -> Option<&str> {
+        self.destructor.as_deref()
+    }
+
+    /// Whether code is emitted for a reference-counting VM (see
+    /// [`with_reference_counting`](Self::with_reference_counting)).
+    ///
+    /// # Examples
+    ///
+    /// See [`with_reference_counting`](Self::with_reference_counting).
+    #[must_use]
+    pub fn reference_counting(&self) -> bool {
+        self.reference_counting
+    }
+
+    /// The clone method name.
+    ///
+    /// # Examples
+    ///
+    /// See [`with_clone_method`](Self::with_clone_method).
+    #[must_use]
+    pub fn clone_method(&self) -> Option<&str> {
+        self.clone_method.as_deref()
     }
 }
 

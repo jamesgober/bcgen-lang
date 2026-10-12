@@ -365,11 +365,15 @@ impl<L: Lookup> Gen<'_, '_, L> {
             Expr::Await(x) => self.coro_unary(x, CoroStep::Await { dst, node }),
             Expr::Spawn(x) => self.coro_unary(x, CoroStep::Spawn { dst, node }),
             Expr::Asm(_) => return Err(self.cx.unsupported(Unsupported::Asm, node)),
-            Expr::Intrinsic { kind, args, .. } => {
+            Expr::Intrinsic {
+                kind,
+                generic_args,
+                args,
+            } => {
                 let Intrinsic::Named(name) = kind else {
                     return Err(self.cx.unsupported(Unsupported::Intrinsic, node));
                 };
-                self.intrinsic_expr(e, name, hir.list(args), dst)?;
+                self.intrinsic_expr(e, name, hir.list(generic_args), hir.list(args), dst)?;
             }
             Expr::Err => {
                 return Err(CompileError::ErrorNode {
@@ -444,6 +448,10 @@ impl<L: Lookup> Gen<'_, '_, L> {
         dst: Dst,
     ) -> Result<(), CompileError> {
         let path = *self.cx.hir.path(p);
+        // `C::X`, `C::$x`, `self::X`, `static::$x`, ...
+        if let Some(m) = self.member_path(p, super::class::Want::Value)? {
+            return self.member_value(m, node, dst);
+        }
         if path.unresolved > 0 {
             return Err(match path.res {
                 Res::Unresolved | Res::Err => CompileError::Unresolved {
@@ -518,8 +526,11 @@ impl<L: Lookup> Gen<'_, '_, L> {
                             self.produced(r, dst);
                         }
                     }
-                    ItemKind::Class(_) | ItemKind::Impl(_) | ItemKind::Interface(_) => {
-                        return Err(self.cx.unsupported(Unsupported::Class, node));
+                    ItemKind::Class(_) | ItemKind::Interface(_) => {
+                        return Err(self.cx.unsupported(Unsupported::ClassValue, node));
+                    }
+                    ItemKind::Impl(_) => {
+                        return Err(self.cx.unsupported(Unsupported::Impl, node));
                     }
                     ItemKind::Record(_) | ItemKind::Sum(_) => {
                         return Err(self.cx.unsupported(Unsupported::Record, node));
@@ -567,14 +578,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 let base = self.pop();
                 let r = self.result_reg(dst);
                 match member {
-                    Member::Named(sym) => {
-                        let name = self.name_ref(sym);
-                        self.emit(Inst::GetProp {
-                            dst: r,
-                            obj: base.reg,
-                            name,
-                        });
-                    }
+                    Member::Named(sym) => self.prop_get(r, base.reg, sym),
                     Member::Index(i) => {
                         let k = self.fx.temp(ValType::Dyn);
                         self.load_dyn_int(k, i64::from(i));
@@ -593,11 +597,11 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 let key = self.pop();
                 let base = self.pop();
                 let r = self.result_reg(dst);
-                self.emit(Inst::DGetIndex {
-                    dst: r,
-                    obj: base.reg,
-                    key: key.reg,
-                });
+                if matches!(hir.expr(e), Expr::Index { .. }) {
+                    self.index_read(r, base.reg, key.reg);
+                } else {
+                    self.dyn_access(crate::unit::DynOp::Get, r, base.reg, key.reg, None);
+                }
                 self.release(key);
                 self.release(base);
                 self.produced(r, dst);
@@ -894,6 +898,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 caps: caps.clone(),
                 aliases,
                 caps_in_params: true,
+                scope: self.scope,
             });
             self.queue(Job::GenEntry {
                 f,
@@ -909,6 +914,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 caps: caps.clone(),
                 aliases,
                 caps_in_params: false,
+                scope: self.scope,
             });
         }
         // Fill the capture window.

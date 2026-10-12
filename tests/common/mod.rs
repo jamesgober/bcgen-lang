@@ -68,16 +68,27 @@ pub enum Outcome {
 pub struct Profile {
     pub php_arrays: bool,
     pub php_keys: bool,
+    /// Compile for a reference-counting VM (dead reference registers are
+    /// cleared); the run stays on the tracing profile, so the comparison
+    /// shows the clearing changes no result.
+    pub clear: bool,
 }
 
 impl Profile {
     pub const PHP: Profile = Profile {
         php_arrays: true,
         php_keys: true,
+        clear: false,
     };
     pub const REFERENCE: Profile = Profile {
         php_arrays: false,
         php_keys: false,
+        clear: false,
+    };
+    pub const PHP_CLEAR: Profile = Profile {
+        php_arrays: true,
+        php_keys: true,
+        clear: true,
     };
 
     pub fn options(self) -> Options {
@@ -93,6 +104,7 @@ impl Profile {
             } else {
                 KeyCoercion::None
             })
+            .with_reference_counting(self.clear)
     }
 }
 

@@ -4,10 +4,11 @@
 #![allow(dead_code)]
 
 use hir_lang::{
-    Arg, ArgKind, Arm, Binder, BinderId, BinderKind, Block, Builder, Capture, CaptureMode, Closure,
-    Def, DefaultEval, Effects, Expr, ExprId, FloatLit, FnDef, Hir, Ident, IntLit, Item, ItemId,
-    ItemKind, Lit, MapEntry, Member, Name, Ns, Op, OpKind, Param, ParamId, ParamKind, Pat, PatId,
-    Path, Res, Segment, Span, Stmt, StmtId, TyId,
+    Arg, ArgKind, Arm, Binder, BinderId, BinderKind, Block, Builder, Capture, CaptureMode,
+    ClassDef, Closure, Def, DefaultEval, Effects, Expr, ExprId, FieldDef, FieldId, FloatLit, FnDef,
+    Hir, Ident, IntLit, InterfaceDef, Intrinsic, Item, ItemId, ItemKind, Lit, MapEntry, Member,
+    MixinRule, MixinUseDef, Name, Ns, Op, OpKind, Param, ParamId, ParamKind, Pat, PatId, Path,
+    PathRoot, Res, Segment, Span, Stmt, StmtId, Ty, TyId, Vis,
 };
 use intern_lang::Interner;
 
@@ -575,5 +576,219 @@ impl H {
     pub fn ty(&mut self, t: hir_lang::Ty) -> TyId {
         self.tick();
         self.b.ty(t)
+    }
+
+    // -------------------------------------------------------------- 0.4 classes
+
+    /// The receiver parameter `$this` of an instance method.
+    pub fn this_param(&mut self) -> (ParamId, BinderId) {
+        self.param("this", ParamKind::Receiver, None, false)
+    }
+
+    /// A method with a body (an instance method when `params` starts with a
+    /// receiver).
+    pub fn method_item(
+        &mut self,
+        name: &str,
+        vis: Vis,
+        params: &[ParamId],
+        body: ExprId,
+    ) -> ItemId {
+        self.method_def(name, vis, params, Some(body), Effects::THROWS)
+    }
+
+    /// A method with the given body (none: abstract) and effects.
+    pub fn method_def(
+        &mut self,
+        name: &str,
+        vis: Vis,
+        params: &[ParamId],
+        body: Option<ExprId>,
+        effects: Effects,
+    ) -> ItemId {
+        self.tick();
+        let n = self.name(name);
+        let params = self.b.list(params);
+        self.b.item(
+            Item::new(
+                Some(n),
+                ItemKind::Fn(FnDef {
+                    params,
+                    body,
+                    effects,
+                    ..FnDef::default()
+                }),
+            )
+            .with_vis(vis),
+        )
+    }
+
+    /// An instance property.
+    pub fn prop(&mut self, name: &str, vis: Vis, default: Option<ExprId>) -> FieldId {
+        self.tick();
+        let id = self.ident(name);
+        self.b.field(FieldDef {
+            name: Some(id),
+            vis,
+            ty: None,
+            default,
+        })
+    }
+
+    /// A static property (a `Global` member).
+    pub fn static_prop(&mut self, name: &str, vis: Vis, init: Option<ExprId>) -> ItemId {
+        self.tick();
+        let n = self.name(name);
+        self.b.item(
+            Item::new(
+                Some(n),
+                ItemKind::Global {
+                    ty: None,
+                    mutable: true,
+                    init,
+                },
+            )
+            .with_vis(vis),
+        )
+    }
+
+    /// A class constant.
+    pub fn class_const(&mut self, name: &str, vis: Vis, value: Option<ExprId>) -> ItemId {
+        self.tick();
+        let n = self.name(name);
+        self.b
+            .item(Item::new(Some(n), ItemKind::Const { ty: None, value }).with_vis(vis))
+    }
+
+    /// A type naming a class by name (left for the resolver).
+    pub fn ty_name(&mut self, name: &str) -> TyId {
+        self.tick();
+        let n = self.name(name);
+        let seg = Segment::new(n, self.b.origin());
+        let segs = self.b.list(&[seg]);
+        let p = self.b.path(Path::new(segs, Ns::Type));
+        self.b.ty(Ty::Path(p))
+    }
+
+    /// A class (or, with `mixin`, a PHP trait).
+    #[allow(clippy::too_many_arguments)]
+    pub fn class_full(
+        &mut self,
+        name: &str,
+        base: Option<&str>,
+        ifaces: &[&str],
+        fields: &[FieldId],
+        items: &[ItemId],
+        is_abstract: bool,
+        mixin: bool,
+    ) -> ItemId {
+        let bases: Vec<TyId> = base.into_iter().map(|b| self.ty_name(b)).collect();
+        let ifs: Vec<TyId> = ifaces.iter().map(|i| self.ty_name(i)).collect();
+        self.tick();
+        let n = self.name(name);
+        let def = ClassDef {
+            bases: self.b.list(&bases),
+            interfaces: self.b.list(&ifs),
+            fields: self.b.list(fields),
+            items: self.b.list(items),
+            is_abstract,
+            mixin,
+            ..ClassDef::default()
+        };
+        self.b
+            .item(Item::new(Some(n), ItemKind::Class(def)).with_vis(Vis::Public))
+    }
+
+    pub fn class(
+        &mut self,
+        name: &str,
+        base: Option<&str>,
+        fields: &[FieldId],
+        items: &[ItemId],
+    ) -> ItemId {
+        self.class_full(name, base, &[], fields, items, false, false)
+    }
+
+    pub fn interface(&mut self, name: &str, supers: &[&str], items: &[ItemId]) -> ItemId {
+        let sups: Vec<TyId> = supers.iter().map(|i| self.ty_name(i)).collect();
+        self.tick();
+        let n = self.name(name);
+        let def = InterfaceDef {
+            supers: self.b.list(&sups),
+            items: self.b.list(items),
+            ..InterfaceDef::default()
+        };
+        self.b
+            .item(Item::new(Some(n), ItemKind::Interface(def)).with_vis(Vis::Public))
+    }
+
+    /// `use A, B { rules }` inside a class.
+    pub fn mixin_use(&mut self, mixins: &[&str], rules: &[MixinRule]) -> ItemId {
+        let ms: Vec<TyId> = mixins.iter().map(|m| self.ty_name(m)).collect();
+        self.tick();
+        let def = MixinUseDef {
+            mixins: self.b.list(&ms),
+            rules: self.b.list(rules),
+        };
+        self.b.item(Item::new(None, ItemKind::MixinUse(def)))
+    }
+
+    /// A path expression rooted at `root` (`self`, `parent`, `static`, or
+    /// relative), left for the resolver.
+    pub fn spath(&mut self, root: PathRoot, segs: &[&str]) -> ExprId {
+        self.tick();
+        let segs: Vec<Segment> = segs
+            .iter()
+            .map(|s| {
+                let n = self.name(s);
+                Segment::new(n, self.b.origin())
+            })
+            .collect();
+        let n = u32::try_from(segs.len()).unwrap_or(0);
+        let list = self.b.list(&segs);
+        let unresolved = if root == PathRoot::Relative { 0 } else { n };
+        let p = self.b.path(Path {
+            root,
+            unresolved,
+            ..Path::new(list, Ns::Value)
+        });
+        self.b.expr(Expr::Path(p))
+    }
+
+    /// A reference by name, left for the resolver.
+    pub fn uname(&mut self, s: &str) -> ExprId {
+        self.tick();
+        let n = self.name(s);
+        self.b.name_expr(n)
+    }
+
+    /// `new C(args)` as the Mox sketch lowers it: the extern `mox.new`.
+    pub fn new_obj(&mut self, class: ExprId, args: &[ExprId]) -> ExprId {
+        let f = self.extern_ref("mox.new");
+        let mut all = vec![class];
+        all.extend_from_slice(args);
+        self.call(f, &all)
+    }
+
+    /// `x instanceof C` (the `mox.instanceof` intrinsic).
+    pub fn instanceof(&mut self, x: ExprId, class: ExprId) -> ExprId {
+        self.intrinsic("mox.instanceof", &[x, class])
+    }
+
+    /// `clone x` (the `mox.clone` intrinsic).
+    pub fn clone_of(&mut self, x: ExprId) -> ExprId {
+        self.intrinsic("mox.clone", &[x])
+    }
+
+    /// A named intrinsic with a type argument (`mox.instanceof<I>(x)`).
+    pub fn intrinsic_ty(&mut self, name: &str, ty: TyId, args: &[ExprId]) -> ExprId {
+        let sym = self.names.intern(name);
+        let args = self.b.list(args);
+        let gargs = self.b.list(&[hir_lang::GenericArg::Ty(ty)]);
+        self.expr(Expr::Intrinsic {
+            kind: Intrinsic::Named(sym),
+            generic_args: gargs,
+            args,
+        })
     }
 }

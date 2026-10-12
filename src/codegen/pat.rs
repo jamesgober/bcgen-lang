@@ -504,6 +504,14 @@ impl<L: Lookup> Gen<'_, '_, L> {
         fail: Label,
         node: NodeRef,
     ) -> Result<(), CompileError> {
+        // A class or interface (PHP's `catch (A | B $e)`): instance tests.
+        if self.mentions_class(ty) {
+            let ok = self.label();
+            self.type_matches(v, ty, ok, 0, node)?;
+            self.jmp(fail);
+            self.bind(ok);
+            return Ok(());
+        }
         let Some(kinds) = super::ops::kind_set(self.cx.hir, ty) else {
             return Err(self.cx.unsupported(Unsupported::Pattern, node));
         };
@@ -515,5 +523,96 @@ impl<L: Lookup> Gen<'_, '_, L> {
         self.jmp(fail);
         self.bind(ok);
         Ok(())
+    }
+
+    /// Whether a type term names a class or interface (a path that is not a
+    /// primitive) anywhere in its unions, intersections, and nullables
+    /// (looked at up to a node budget; past it, assumed so).
+    fn mentions_class(&self, ty: TyId) -> bool {
+        if self.cx.ct.is_empty() {
+            return false;
+        }
+        let hir = self.cx.hir;
+        let mut stack = alloc::vec![ty];
+        let mut budget = 4096u32;
+        while let Some(t) = stack.pop() {
+            if budget == 0 {
+                return true;
+            }
+            budget -= 1;
+            match *hir.ty(t) {
+                hir_lang::Ty::Nullable(inner) => stack.push(inner),
+                hir_lang::Ty::Union(list) | hir_lang::Ty::Intersection(list) => {
+                    stack.extend_from_slice(hir.list(list));
+                }
+                hir_lang::Ty::Path(p) => {
+                    let path = hir.path(p);
+                    if !matches!(path.res, Res::Prim(_)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Jumps to `ok` when `v` matches `ty`; falls through otherwise. Kinds
+    /// test by dynamic kind, classes and interfaces by instance; unions try
+    /// each member, intersections need every member. Nesting is capped at
+    /// 64 levels.
+    fn type_matches(
+        &mut self,
+        v: Reg,
+        ty: TyId,
+        ok: Label,
+        depth: u32,
+        node: NodeRef,
+    ) -> Result<(), CompileError> {
+        if depth > 64 {
+            return Err(self.cx.unsupported(Unsupported::Pattern, node));
+        }
+        let hir = self.cx.hir;
+        match *hir.ty(ty) {
+            hir_lang::Ty::Nullable(inner) => {
+                let b = self.fx.temp(ValType::Bool);
+                self.emit(Inst::IsKind {
+                    dst: b,
+                    src: v,
+                    kind: Kind::Nil,
+                });
+                self.jump_on(b, ok, true);
+                self.fx.release(b);
+                self.type_matches(v, inner, ok, depth + 1, node)
+            }
+            hir_lang::Ty::Union(list) => {
+                for &m in hir.list(list) {
+                    self.type_matches(v, m, ok, depth + 1, node)?;
+                }
+                Ok(())
+            }
+            hir_lang::Ty::Intersection(list) => {
+                let fail = self.label();
+                for &m in hir.list(list) {
+                    let pass = self.label();
+                    self.type_matches(v, m, pass, depth + 1, node)?;
+                    self.jmp(fail);
+                    self.bind(pass);
+                }
+                self.jmp(ok);
+                self.bind(fail);
+                Ok(())
+            }
+            _ => {
+                if self.class_type_test(v, ty, ok)? {
+                    return Ok(());
+                }
+                let Some(kinds) = super::ops::kind_set(hir, ty) else {
+                    return Err(self.cx.unsupported(Unsupported::Pattern, node));
+                };
+                self.test_kinds(v, kinds, ok);
+                Ok(())
+            }
+        }
     }
 }

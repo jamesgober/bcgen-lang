@@ -153,15 +153,338 @@ fn feature(e: CompileError) -> Unsupported {
 }
 
 #[test]
-fn classes_are_reported_for_0_5() {
+fn impls_and_multiple_bases_are_reported() {
+    // An `impl` block (typed fast paths, 0.5).
     let e = unsupported(|h| {
+        let t = h.ty(Ty::Infer);
         h.tick();
-        let n = h.name("C");
-        let c =
-            h.b.item(Item::new(Some(n), ItemKind::Class(ClassDef::default())));
-        (vec![c], None)
+        let i = h.b.item(Item::new(
+            None,
+            ItemKind::Impl(hir_lang::ImplDef {
+                generics: hir_lang::Generics::default(),
+                interface: None,
+                self_ty: t,
+                items: hir_lang::List::EMPTY,
+            }),
+        ));
+        (vec![i], None)
     });
-    assert_eq!(feature(e), Unsupported::Class);
+    assert_eq!(feature(e), Unsupported::Impl);
+    // Python's several bases: an LSB struct has one parent.
+    let mut h = H::new();
+    let a = h.class("A", None, &[], &[]);
+    let b = h.class("B", None, &[], &[]);
+    let ta = class_ty(&mut h, "A", a);
+    let tb = class_ty(&mut h, "B", b);
+    h.tick();
+    let n = h.name("C");
+    let bases = h.b.list(&[ta, tb]);
+    let c = h.b.item(Item::new(
+        Some(n),
+        ItemKind::Class(ClassDef {
+            bases,
+            ..ClassDef::default()
+        }),
+    ));
+    let (hir, names) = h.finish(&[a, b, c], None);
+    let e = Compiler::new(entry()).compile(&hir, &names).unwrap_err();
+    assert_eq!(feature(e), Unsupported::MultipleInheritance);
+}
+
+/// A type naming class `item`, resolved.
+fn class_ty(h: &mut H, name: &str, item: hir_lang::ItemId) -> hir_lang::TyId {
+    let d = h.b.def(hir_lang::Def::Item(item));
+    let p = h.path_ns(name, hir_lang::Ns::Type, hir_lang::Res::Def(d));
+    h.ty(Ty::Path(p))
+}
+
+/// A chain of `n` classes, each extending the previous one, resolved.
+fn chain(h: &mut H, n: usize) -> Vec<hir_lang::ItemId> {
+    let mut items: Vec<hir_lang::ItemId> = Vec::with_capacity(n);
+    for i in 0..n {
+        let bases = match items.last() {
+            Some(&prev) => {
+                let t = class_ty(h, &format!("C{}", i - 1), prev);
+                h.b.list(&[t])
+            }
+            None => hir_lang::List::EMPTY,
+        };
+        h.tick();
+        let name = h.name(&format!("C{i}"));
+        items.push(h.b.item(Item::new(
+            Some(name),
+            ItemKind::Class(ClassDef {
+                bases,
+                ..ClassDef::default()
+            }),
+        )));
+    }
+    items
+}
+
+#[test]
+fn inheritance_chains_load_up_to_bvm_s_depth_and_deeper_ones_are_refused() {
+    // 256 classes deep: bvm-lang's `MAX_INHERITANCE_DEPTH`; it loads, and an
+    // instance of the deepest is an instance of the first.
+    let mut h = H::new();
+    let items = chain(&mut h, 256);
+    let last = *items.last().unwrap_or_else(|| panic!("items"));
+    let first = items[0];
+    let lr = h.item_ref("C255", last);
+    let f = h.extern_ref("mox.new");
+    let o = h.call(f, &[lr]);
+    let fr = h.item_ref("C0", first);
+    let t = h.intrinsic("mox.instanceof", &[o, fr]);
+    let (hir, names) = small_stack(|| h.finish(&items, Some(t)));
+    let out = small_stack(|| {
+        Compiler::new(entry().with_intrinsics(bcgen_lang::Intrinsics::mox())).compile(&hir, &names)
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run(&out), Value::Bool(true));
+    // 257: refused before the VM would refuse it.
+    let mut h = H::new();
+    let items = chain(&mut h, 257);
+    let (hir, names) = h.finish(&items, None);
+    let e = bcgen_lang::compile(&hir, &names).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            CompileError::Class {
+                problem: bcgen_lang::ClassProblem::TooDeep { limit: 256 },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn class_graph_errors_are_precise() {
+    use bcgen_lang::ClassProblem;
+    let problem = |e: CompileError| match e {
+        CompileError::Class { problem, .. } => problem,
+        e => panic!("not a class problem: {e:?}"),
+    };
+    // A cycle: A extends B, B extends A (built by hand: forward references).
+    let mut h = H::new();
+    let mut ids = Vec::new();
+    for name in ["A", "B"] {
+        h.tick();
+        let n = h.name(name);
+        ids.push(h.b.item(Item::new(Some(n), ItemKind::Class(ClassDef::default()))));
+    }
+    let (hir, names) = h.finish(&ids, None);
+    // Rebuild with the bases now that both ids are known.
+    let _ = (hir, names);
+    let mut h = H::new();
+    h.tick();
+    let an = h.name("A");
+    let bn = h.name("B");
+    // Item ids are dense: A is the item made after its base type's nodes.
+    let a_guess = hir_lang::ItemId::from_index(0).unwrap_or_else(|| panic!("id"));
+    let b_guess = hir_lang::ItemId::from_index(1).unwrap_or_else(|| panic!("id"));
+    let tb = class_ty(&mut h, "B", b_guess);
+    let ta = class_ty(&mut h, "A", a_guess);
+    let ba = h.b.list(&[tb]);
+    let bb = h.b.list(&[ta]);
+    let a = h.b.item(Item::new(
+        Some(an),
+        ItemKind::Class(ClassDef {
+            bases: ba,
+            ..ClassDef::default()
+        }),
+    ));
+    let b = h.b.item(Item::new(
+        Some(bn),
+        ItemKind::Class(ClassDef {
+            bases: bb,
+            ..ClassDef::default()
+        }),
+    ));
+    assert_eq!((a, b), (a_guess, b_guess));
+    let (hir, names) = h.finish(&[a, b], None);
+    assert_eq!(
+        problem(bcgen_lang::compile(&hir, &names).unwrap_err()),
+        ClassProblem::Cycle
+    );
+
+    // Extending an interface; implementing a class; using a class as a mixin.
+    let mut h = H::new();
+    let i = h.interface("I", &[], &[]);
+    let ti = class_ty(&mut h, "I", i);
+    let bases = h.b.list(&[ti]);
+    h.tick();
+    let n = h.name("C");
+    let c = h.b.item(Item::new(
+        Some(n),
+        ItemKind::Class(ClassDef {
+            bases,
+            ..ClassDef::default()
+        }),
+    ));
+    let (hir, names) = h.finish(&[i, c], None);
+    assert_eq!(
+        problem(bcgen_lang::compile(&hir, &names).unwrap_err()),
+        ClassProblem::NotAClass
+    );
+    let mut h = H::new();
+    let k = h.class("K", None, &[], &[]);
+    let tk = class_ty(&mut h, "K", k);
+    let ifs = h.b.list(&[tk]);
+    h.tick();
+    let n = h.name("C");
+    let c = h.b.item(Item::new(
+        Some(n),
+        ItemKind::Class(ClassDef {
+            interfaces: ifs,
+            ..ClassDef::default()
+        }),
+    ));
+    let (hir, names) = h.finish(&[k, c], None);
+    assert_eq!(
+        problem(bcgen_lang::compile(&hir, &names).unwrap_err()),
+        ClassProblem::NotAnInterface
+    );
+    let mut h = H::new();
+    let k = h.class("K", None, &[], &[]);
+    let tk = class_ty(&mut h, "K", k);
+    let mixins = h.b.list(&[tk]);
+    h.tick();
+    let u = h.b.item(Item::new(
+        None,
+        ItemKind::MixinUse(hir_lang::MixinUseDef {
+            mixins,
+            rules: hir_lang::List::EMPTY,
+        }),
+    ));
+    let c = h.class("C", None, &[], &[u]);
+    let (hir, names) = h.finish(&[k, c], None);
+    assert_eq!(
+        problem(bcgen_lang::compile(&hir, &names).unwrap_err()),
+        ClassProblem::NotAMixin
+    );
+    // A destructor that takes a parameter.
+    let mut h = H::new();
+    let (tp, _) = h.this_param();
+    let (px, _) = h.param("x", ParamKind::Normal, None, false);
+    let body = h.block(&[], None);
+    let d = h.method_item("__destruct", hir_lang::Vis::Public, &[tp, px], body);
+    let c = h.class("C", None, &[], &[d]);
+    let (hir, names) = h.finish(&[c], None);
+    assert_eq!(
+        problem(bcgen_lang::compile(&hir, &names).unwrap_err()),
+        ClassProblem::BadDestructor
+    );
+}
+
+#[test]
+fn a_mixin_that_uses_itself_is_a_cycle() {
+    let mut h = H::new();
+    h.tick();
+    let tn = h.name("T");
+    let guess = hir_lang::ItemId::from_index(1).unwrap_or_else(|| panic!("id"));
+    let tt = class_ty(&mut h, "T", guess);
+    let mixins = h.b.list(&[tt]);
+    h.tick();
+    let u = h.b.item(Item::new(
+        None,
+        ItemKind::MixinUse(hir_lang::MixinUseDef {
+            mixins,
+            rules: hir_lang::List::EMPTY,
+        }),
+    ));
+    let items = h.b.list(&[u]);
+    let t = h.b.item(Item::new(
+        Some(tn),
+        ItemKind::Class(ClassDef {
+            items,
+            mixin: true,
+            ..ClassDef::default()
+        }),
+    ));
+    assert_eq!(t, guess);
+    let (hir, names) = h.finish(&[t], None);
+    assert!(matches!(
+        bcgen_lang::compile(&hir, &names).unwrap_err(),
+        CompileError::Class {
+            problem: bcgen_lang::ClassProblem::Cycle,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn huge_member_counts_compile_within_the_budget_or_hit_it() {
+    // 20,000 properties and 20,000 methods on one class: compiles, loads,
+    // and runs.
+    let mut h = H::new();
+    let mut fields = Vec::new();
+    for i in 0..20_000 {
+        let v = h.int(i);
+        fields.push(h.prop(&format!("p{i}"), hir_lang::Vis::Public, Some(v)));
+    }
+    let mut methods = Vec::new();
+    for i in 0..20_000 {
+        let (tp, _) = h.this_param();
+        let v = h.int(i);
+        let body = h.block(&[], Some(v));
+        methods.push(h.method_item(&format!("m{i}"), hir_lang::Vis::Public, &[tp], body));
+    }
+    let c = h.class("Big", None, &fields, &methods);
+    let cr = h.item_ref("Big", c);
+    let f = h.extern_ref("mox.new");
+    let o = h.call(f, &[cr]);
+    let call = h.method(o, "m19999", &[]);
+    let (hir, names) = h.finish(&[c], Some(call));
+    let opts = entry().with_intrinsics(bcgen_lang::Intrinsics::mox());
+    let out = Compiler::new(opts.clone())
+        .compile(&hir, &names)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run(&out), Value::Int(19_999));
+    // The same class under a small budget: a budget error, not a panic.
+    let e = Compiler::new(opts.with_max_instructions(10_000))
+        .compile(&hir, &names)
+        .unwrap_err();
+    assert!(matches!(e, CompileError::BudgetExceeded { .. }), "{e:?}");
+}
+
+#[test]
+fn a_deep_chain_with_many_members_hits_the_budget_not_quadratic_time() {
+    // 256 classes, each adding 250 properties (64,000 slots in the
+    // deepest, under the 65,536 limit): the layouts are 256 * 257 / 2 * 250
+    // slots (8.2 million), charged to the budget.
+    let mut h = H::new();
+    let mut items: Vec<hir_lang::ItemId> = Vec::new();
+    for i in 0..256 {
+        let fields: Vec<_> = (0..250)
+            .map(|j| h.prop(&format!("p{i}_{j}"), hir_lang::Vis::Public, None))
+            .collect();
+        let bases = match items.last() {
+            Some(&prev) => {
+                let t = class_ty(&mut h, &format!("C{}", i - 1), prev);
+                h.b.list(&[t])
+            }
+            None => hir_lang::List::EMPTY,
+        };
+        let fl = h.b.list(&fields);
+        h.tick();
+        let name = h.name(&format!("C{i}"));
+        items.push(h.b.item(Item::new(
+            Some(name),
+            ItemKind::Class(ClassDef {
+                bases,
+                fields: fl,
+                ..ClassDef::default()
+            }),
+        )));
+    }
+    let (hir, names) = h.finish(&items, None);
+    let t = std::time::Instant::now();
+    let e = Compiler::new(entry().with_max_instructions(1 << 22))
+        .compile(&hir, &names)
+        .unwrap_err();
+    assert!(matches!(e, CompileError::BudgetExceeded { .. }), "{e:?}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(20));
 }
 
 #[test]

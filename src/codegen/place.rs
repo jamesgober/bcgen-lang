@@ -52,6 +52,9 @@ pub(crate) enum Root {
     Slot(Slot),
     /// Any other expression, evaluated once to a register.
     Value,
+    /// A reference in a register: a late-bound static property
+    /// (`static::$x`), whose accessor returns its reference.
+    Cell,
 }
 
 /// Where an operand of a place comes from.
@@ -61,6 +64,8 @@ enum Src {
     Expr { e: ExprId, index: bool },
     /// A register an enclosing `let_place` already holds.
     Reg(Reg),
+    /// The reference of the late-bound static property `name`.
+    Late { name: Symbol, node: NodeRef },
 }
 
 /// A place whose operands are evaluated: the root value (for a value root)
@@ -126,13 +131,52 @@ pub(crate) enum PlaceStep {
 }
 
 impl<L: Lookup> Gen<'_, '_, L> {
+    /// The late-bound static property a path names (`static::$x`), if it
+    /// names one.
+    pub(crate) fn late_static(&self, e: ExprId) -> Result<Option<Symbol>, CompileError> {
+        let Expr::Path(p) = *self.cx.hir.expr(e) else {
+            return Ok(None);
+        };
+        match self.member_path(p, super::class::Want::Value)? {
+            Some(super::class::MemberRef::Late { name }) => Ok(Some(name)),
+            _ => Ok(None),
+        }
+    }
+
     /// The slot a path names as an assignment target.
-    pub(crate) fn place_slot(&self, e: ExprId) -> Result<Option<Slot>, CompileError> {
+    pub(crate) fn place_slot(&mut self, e: ExprId) -> Result<Option<Slot>, CompileError> {
         let node = NodeRef::Expr(e);
         let hir = self.cx.hir;
         let Expr::Path(p) = *hir.expr(e) else {
             return Ok(None);
         };
+        match self.member_path(p, super::class::Want::Value)? {
+            Some(super::class::MemberRef::Value {
+                global,
+                is_static: true,
+                denied,
+            }) => {
+                if let Some(d) = denied {
+                    self.raise_denied(d);
+                }
+                return Ok(Some(Slot::GlobalCell(global)));
+            }
+            Some(super::class::MemberRef::Late { .. }) => return Ok(None),
+            Some(super::class::MemberRef::Missing { class, ns, name }) => {
+                // PHP raises where the write runs; the code after it is
+                // unreachable but needs a slot.
+                let msg = self.missing_msg(class, ns, name);
+                self.raise_msg(&msg);
+                return Ok(Some(Slot::Global(self.cx.scratch_global())));
+            }
+            Some(_) => {
+                return Err(CompileError::NotAssignable {
+                    node,
+                    span: self.cx.span(node),
+                });
+            }
+            None => {}
+        }
         let path = *hir.path(p);
         if path.unresolved > 0 {
             return Err(self.cx.unsupported(Unsupported::TypeDirected, node));
@@ -172,7 +216,8 @@ impl<L: Lookup> Gen<'_, '_, L> {
         let tnode = NodeRef::Expr(target);
         let hir = self.cx.hir;
         let dup = self.needs_dup(value);
-        if let Expr::Path(_) = *hir.expr(target) {
+        let late = self.late_static(target)?.is_some();
+        if let (Expr::Path(_), false) = (*hir.expr(target), late) {
             let Some(slot) = self.place_slot(target)? else {
                 return Err(CompileError::Unresolved {
                     node: tnode,
@@ -327,6 +372,9 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     reg,
                     rel: Rel::Keep,
                 }),
+                Src::Late { name, node } => {
+                    Task::Step(Step::Class(super::class::ClassStep::LateRef { name, node }))
+                }
             });
         }
         for k in &keys {
@@ -341,6 +389,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     reg,
                     rel: Rel::Keep,
                 })),
+                Src::Late { .. } => {}
             }
         }
         let idx = u32::try_from(self.places.len()).unwrap_or(u32::MAX);
@@ -360,7 +409,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
     /// spliced in with the operands it already holds.
     #[allow(clippy::type_complexity)]
     fn chain(
-        &self,
+        &mut self,
         target: ExprId,
     ) -> Result<(Root, Option<Src>, Vec<PStep>, Vec<Src>), CompileError> {
         let hir = self.cx.hir;
@@ -396,6 +445,13 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 Expr::Append(base) => {
                     steps.push(PStep::Append);
                     cur = base;
+                }
+                Expr::Path(_) if self.late_static(cur)?.is_some() => {
+                    let name = self.late_static(cur)?;
+                    let Some(name) = name else {
+                        break (Root::Value, None, None);
+                    };
+                    break (Root::Cell, Some(Src::Late { name, node }), None);
                 }
                 Expr::Path(_) => match self.place_slot(cur) {
                     Ok(Some(Slot::Place(i))) => {
@@ -661,6 +717,10 @@ impl<L: Lookup> Gen<'_, '_, L> {
         let cur = self.fx.temp(ValType::Dyn);
         match (p.root, p.root_val) {
             (Some(Root::Slot(s)), _) => self.read_slot_at(s, cur, node)?,
+            (Some(Root::Cell), Some(v)) => self.emit(Inst::CellGet {
+                dst: cur,
+                cell: v.reg,
+            }),
             (_, Some(v)) => self.emit(Inst::Mov {
                 dst: cur,
                 src: v.reg,
@@ -688,13 +748,15 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 });
             }
             match (s, self.step_key(s, &p.keys, &mut ki)) {
-                (PStep::Prop(name), _) => {
-                    let n = self.name_ref(name);
-                    self.emit(Inst::GetProp {
-                        dst: cur,
-                        obj: cur,
-                        name: n,
-                    });
+                (PStep::Prop(name), _) => self.prop_get(cur, cur, name),
+                (PStep::Index, Some((k, own))) => {
+                    self.index_read(cur, cur, k);
+                    if own {
+                        self.fx.release(k);
+                    }
+                }
+                (PStep::DynProp, Some((k, _))) => {
+                    self.dyn_access(crate::unit::DynOp::Get, cur, cur, k, None);
                 }
                 (_, Some((k, own))) => {
                     self.emit(Inst::DGetIndex {
@@ -734,8 +796,13 @@ impl<L: Lookup> Gen<'_, '_, L> {
             let m = self.new_map();
             self.emit(Inst::Mov { dst: cur, src: m });
             self.fx.release(m);
-            if let Some(Root::Slot(s)) = p.root {
-                self.write_slot_at(s, cur, node)?;
+            match (p.root, p.root_val) {
+                (Some(Root::Slot(s)), _) => self.write_slot_at(s, cur, node)?,
+                (Some(Root::Cell), Some(v)) => self.emit(Inst::CellSet {
+                    cell: v.reg,
+                    src: cur,
+                }),
+                _ => {}
             }
             self.bind(have);
         }
@@ -789,14 +856,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
         if !php {
             // Shared references: read the child as an expression would.
             match (s, key) {
-                (PStep::Prop(name), _) => {
-                    let n = self.name_ref(name);
-                    self.emit(Inst::GetProp {
-                        dst: cur,
-                        obj: cur,
-                        name: n,
-                    });
-                }
+                (PStep::Prop(name), _) => self.prop_get(cur, cur, name),
                 (_, Some(k)) => self.emit(Inst::DGetIndex {
                     dst: cur,
                     obj: cur,
@@ -812,25 +872,28 @@ impl<L: Lookup> Gen<'_, '_, L> {
         let have = self.label();
         match (s, key) {
             (PStep::Prop(name), _) => {
-                let n = self.name_ref(name);
-                self.emit(Inst::DSepProp {
-                    dst: child,
-                    obj: cur,
-                    name: n,
-                });
-                self.emit(Inst::IsKind {
-                    dst: b,
-                    src: child,
-                    kind: Kind::Nil,
-                });
-                self.jump_on(b, have, false);
-                let m = self.new_map();
-                self.emit(Inst::Mov { dst: child, src: m });
-                self.fx.release(m);
-                self.emit(Inst::SetProp {
-                    obj: cur,
-                    name: n,
-                    src: child,
+                self.select(cur, crate::class::Ns::Prop, name, |g, n| {
+                    let set = g.label();
+                    g.emit(Inst::DSepProp {
+                        dst: child,
+                        obj: cur,
+                        name: n,
+                    });
+                    g.emit(Inst::IsKind {
+                        dst: b,
+                        src: child,
+                        kind: Kind::Nil,
+                    });
+                    g.jump_on(b, set, false);
+                    let m = g.new_map();
+                    g.emit(Inst::Mov { dst: child, src: m });
+                    g.fx.release(m);
+                    g.emit(Inst::SetProp {
+                        obj: cur,
+                        name: n,
+                        src: child,
+                    });
+                    g.bind(set);
                 });
             }
             (_, Some(k)) => {
@@ -872,8 +935,15 @@ impl<L: Lookup> Gen<'_, '_, L> {
         node: NodeRef,
     ) -> Result<(), CompileError> {
         let Some(&last) = p.steps.last() else {
-            return match p.root {
-                Some(Root::Slot(s)) => self.write_slot_at(s, v, node),
+            return match (p.root, p.root_val) {
+                (Some(Root::Slot(s)), _) => self.write_slot_at(s, v, node),
+                (Some(Root::Cell), Some(c)) => {
+                    self.emit(Inst::CellSet {
+                        cell: c.reg,
+                        src: v,
+                    });
+                    Ok(())
+                }
                 _ => Err(CompileError::NotAssignable {
                     node,
                     span: self.cx.span(node),
@@ -886,13 +956,11 @@ impl<L: Lookup> Gen<'_, '_, L> {
             ki -= 1;
         }
         match (last, self.step_key(last, &p.keys, &mut ki)) {
-            (PStep::Prop(name), _) => {
-                let n = self.name_ref(name);
-                self.emit(Inst::SetProp {
-                    obj: cur,
-                    name: n,
-                    src: v,
-                });
+            (PStep::Prop(name), _) => self.prop_set(cur, name, v),
+            (PStep::DynProp, Some((k, _))) => {
+                let t = self.fx.temp(ValType::Dyn);
+                self.dyn_access(crate::unit::DynOp::Set, t, cur, k, Some(v));
+                self.fx.release(t);
             }
             (PStep::Append, _) => {
                 let map_ty = self.map_ty();
@@ -945,13 +1013,17 @@ impl<L: Lookup> Gen<'_, '_, L> {
         node: NodeRef,
     ) -> Result<(), CompileError> {
         let Some(&last) = p.steps.last() else {
-            return match p.root {
-                Some(Root::Slot(Slot::Cell(c))) => {
+            return match (p.root, p.root_val) {
+                (Some(Root::Slot(Slot::Cell(c))), _) => {
                     self.emit(Inst::Mov { dst, src: c });
                     Ok(())
                 }
-                Some(Root::Slot(Slot::GlobalCell(g))) => {
+                (Some(Root::Slot(Slot::GlobalCell(g))), _) => {
                     self.emit(Inst::GetGlobal { dst, global: g });
+                    Ok(())
+                }
+                (Some(Root::Cell), Some(c)) => {
+                    self.emit(Inst::Mov { dst, src: c.reg });
                     Ok(())
                 }
                 _ => Err(self.cx.unsupported(Unsupported::RefPlace, node)),
@@ -963,14 +1035,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
             ki -= 1;
         }
         match (last, self.step_key(last, &p.keys, &mut ki)) {
-            (PStep::Prop(name), _) => {
-                let n = self.name_ref(name);
-                self.emit(Inst::DRefProp {
-                    dst,
-                    obj: cur,
-                    name: n,
-                });
-            }
+            (PStep::Prop(name), _) => self.prop_ref(dst, cur, name),
             (_, Some((k, own))) => {
                 self.emit(Inst::DRefIndex {
                     dst,
@@ -1000,6 +1065,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
                     self.emit(Inst::SetGlobal { global: g, src });
                     Ok(())
                 }
+                Some(Root::Cell) => Err(self.cx.unsupported(Unsupported::StaticRef, node)),
                 _ => Err(self.cx.unsupported(Unsupported::RefPlace, node)),
             };
         };
@@ -1009,14 +1075,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
             ki -= 1;
         }
         match (last, self.step_key(last, &p.keys, &mut ki)) {
-            (PStep::Prop(name), _) => {
-                let n = self.name_ref(name);
-                self.emit(Inst::DBindProp {
-                    obj: cur,
-                    name: n,
-                    src,
-                });
-            }
+            (PStep::Prop(name), _) => self.prop_bind(cur, name, src),
             (_, Some((k, own))) => {
                 self.emit(Inst::DBindIndex {
                     obj: cur,

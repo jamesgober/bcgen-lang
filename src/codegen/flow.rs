@@ -837,6 +837,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
         let mut targets = alloc::vec![l_normal, l_return, l_throw];
         targets.extend(exits.iter().map(|&(_, l)| l));
         let _ = self.fx.f.switch(IntTy::I8, fin.kind, &targets, l_normal);
+        self.fx.dead = true;
         self.fx.origins.push(self.fx.node);
         self.cx.emitted += 1;
         let value = Val {

@@ -19,18 +19,24 @@ pub(crate) struct Analysis {
     /// Per closure: the outer value binders it uses (implicit captures,
     /// transitively through nested closures), in first-use order.
     pub(crate) captures: BTreeMap<ExprId, Vec<BinderId>>,
-    /// Function items, in canonical (pre)order.
+    /// Function items that are not class members, in canonical (pre)order.
     pub(crate) fns: Vec<ItemId>,
-    /// Global and constant items, in canonical order.
+    /// Global and constant items that are not class members, in canonical
+    /// order.
     pub(crate) globals: Vec<ItemId>,
+    /// Class and interface items (mixins included), in canonical order.
+    pub(crate) classes: Vec<ItemId>,
+    /// Items declared directly in a class or interface: methods, static
+    /// properties, constants, aliases, mixin uses.
+    pub(crate) members: BTreeSet<ItemId>,
     /// Items the start function may need to run code for (globals,
-    /// constants, functions with once-evaluated defaults, nested modules),
-    /// in canonical order.
+    /// constants, functions with once-evaluated defaults, nested modules,
+    /// classes), in canonical order.
     pub(crate) inits: Vec<ItemId>,
     /// Nested modules with a body, in canonical order (their bodies run in
     /// the start function).
     pub(crate) module_bodies: Vec<ItemId>,
-    /// The first item kind with code this release does not compile.
+    /// The first `impl` block (this release does not compile them).
     pub(crate) unsupported_item: Option<ItemId>,
     /// Global items shared by reference (through a `global` alias, a place
     /// argument, or a reference assignment): their storage is a reference.
@@ -47,6 +53,8 @@ impl Analysis {
             captures: BTreeMap::new(),
             fns: Vec::new(),
             globals: Vec::new(),
+            classes: Vec::new(),
+            members: BTreeSet::new(),
             module_bodies: Vec::new(),
             inits: Vec::new(),
             unsupported_item: None,
@@ -56,9 +64,26 @@ impl Analysis {
         let mut aliases: Vec<(BinderId, hir_lang::PathId)> = Vec::new();
         let mut by_ref_closures: BTreeSet<ExprId> = BTreeSet::new();
         let mut closures = false;
+        // The items enclosing the walk's position.
+        let mut items: Vec<ItemId> = Vec::new();
         hir.walk_from(NodeRef::Item(hir.root()), |event| {
             match event {
-                Event::Enter(NodeRef::Item(id)) => a.item(hir, id),
+                Event::Enter(NodeRef::Item(id)) => {
+                    let in_class = items.last().is_some_and(|&p| {
+                        matches!(
+                            hir.item(p).kind,
+                            ItemKind::Class(_) | ItemKind::Interface(_)
+                        )
+                    });
+                    if in_class {
+                        let _ = a.members.insert(id);
+                    }
+                    a.item(hir, id, in_class);
+                    items.push(id);
+                }
+                Event::Leave(NodeRef::Item(_)) => {
+                    let _ = items.pop();
+                }
                 Event::Enter(NodeRef::Param(id)) => {
                     let p = hir.param(id);
                     if p.by_ref {
@@ -144,25 +169,32 @@ impl Analysis {
         }
     }
 
-    fn item(&mut self, hir: &Hir, id: ItemId) {
+    fn item(&mut self, hir: &Hir, id: ItemId, member: bool) {
+        let kind = hir.item(id).kind;
+        if member {
+            // Class members are declared by the class table; their
+            // initializers run with their class's.
+            return;
+        }
         if matches!(
-            hir.item(id).kind,
+            kind,
             ItemKind::Fn(_)
                 | ItemKind::Global { .. }
                 | ItemKind::Const { .. }
                 | ItemKind::Module { .. }
+                | ItemKind::Class(_)
+                | ItemKind::Interface(_)
         ) {
             self.inits.push(id);
         }
-        match hir.item(id).kind {
+        match kind {
             ItemKind::Fn(_) => self.fns.push(id),
             ItemKind::Global { .. } | ItemKind::Const { .. } => self.globals.push(id),
             ItemKind::Module { body: Some(_), .. } if id != hir.root() => {
                 self.module_bodies.push(id);
             }
-            ItemKind::Class(_) | ItemKind::Impl(_) | ItemKind::MixinUse(_)
-                if self.unsupported_item.is_none() =>
-            {
+            ItemKind::Class(_) | ItemKind::Interface(_) => self.classes.push(id),
+            ItemKind::Impl(_) if self.unsupported_item.is_none() => {
                 self.unsupported_item = Some(id);
             }
             _ => {}

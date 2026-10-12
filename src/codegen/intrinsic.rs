@@ -50,6 +50,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
         &mut self,
         e: ExprId,
         name: Symbol,
+        generic_args: &[hir_lang::GenericArg],
         args: &[ExprId],
         dst: Dst,
     ) -> Result<(), CompileError> {
@@ -62,6 +63,19 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 span: self.cx.span(node),
             });
         };
+        // A class operation checks its own arity (a type operand in the
+        // generic arguments replaces the class operand).
+        if let Lowering::Class { op, module, name } = def.lowering() {
+            let ty = generic_args.iter().find_map(|g| match *g {
+                hir_lang::GenericArg::Ty(t) => Some(t),
+                _ => None,
+            });
+            let list: Vec<hir_lang::Arg> =
+                args.iter().map(|&a| hir_lang::Arg::positional(a)).collect();
+            let host = (module.clone(), name.clone());
+            let op = *op;
+            return self.class_op(op, host, ty, &list, dst, node);
+        }
         if !def.arity().accepts(args.len()) {
             return Err(CompileError::IntrinsicArity {
                 node,
@@ -90,6 +104,7 @@ impl<L: Lookup> Gen<'_, '_, L> {
             }
             Lowering::Host { module, name } => (None, module.clone(), name.clone()),
             Lowering::Fast { fast, module, name } => (Some(*fast), module.clone(), name.clone()),
+            Lowering::Class { .. } => return Ok(()),
         };
         // `accepts` bounds the count by 255.
         let argc = u8::try_from(args.len()).unwrap_or(u8::MAX);
@@ -510,7 +525,165 @@ impl<L: Lookup> Gen<'_, '_, L> {
                 self.need_kind(a, Kind::Map, slow);
                 self.emit(Inst::Mov { dst: r, src: a });
             }
+            Fast::StrOffset => self.fast_str_offset(a, b, r, slow),
         }
+    }
+
+    /// PHP 7.1+'s `$s[i]` for an in-range integer offset: the one-byte
+    /// string at `i` (from the end when negative).
+    fn fast_str_offset(&mut self, a: Reg, b: Reg, r: Reg, slow: Label) {
+        self.need_kind(a, Kind::Str, slow);
+        self.need_kind(b, Kind::Int, slow);
+        let s = self.fx.temp(ValType::Str);
+        let i = self.fx.temp(ValType::I64);
+        let n = self.fx.temp(ValType::I64);
+        let z = self.fx.temp(ValType::I64);
+        let t = self.fx.temp(ValType::Bool);
+        let op = bytecode_lang::IntOp::new(IntTy::I64);
+        self.emit(Inst::FromDyn {
+            dst: s,
+            src: a,
+            to: BPrim::Str,
+        });
+        self.emit(Inst::FromDyn {
+            dst: i,
+            src: b,
+            to: BPrim::I64,
+        });
+        self.emit(Inst::StrLen { dst: n, s });
+        self.load_i64(z, 0);
+        // A negative offset counts from the end.
+        let positive = self.label();
+        self.emit(Inst::ILt {
+            dst: t,
+            lhs: i,
+            rhs: z,
+            ty: IntTy::I64,
+        });
+        self.jump_on(t, positive, false);
+        self.emit(Inst::IAdd {
+            dst: i,
+            lhs: i,
+            rhs: n,
+            op,
+        });
+        self.emit(Inst::ILt {
+            dst: t,
+            lhs: i,
+            rhs: z,
+            ty: IntTy::I64,
+        });
+        self.jump_on(t, slow, true);
+        self.bind(positive);
+        self.emit(Inst::IGe {
+            dst: t,
+            lhs: i,
+            rhs: n,
+            ty: IntTy::I64,
+        });
+        self.jump_on(t, slow, true);
+        // `str_slice` takes its range from two consecutive registers.
+        let range = self.fx.window(&[ValType::I64, ValType::I64]);
+        let one = self.fx.temp(ValType::I64);
+        self.load_i64(one, 1);
+        self.emit(Inst::Mov {
+            dst: FnCx::slot(range.1, 0),
+            src: i,
+        });
+        self.emit(Inst::IAdd {
+            dst: FnCx::slot(range.1, 1),
+            lhs: i,
+            rhs: one,
+            op,
+        });
+        let out = self.fx.temp(ValType::Str);
+        self.emit(Inst::StrSlice {
+            dst: out,
+            s,
+            range: range.1,
+            utf8: false,
+        });
+        self.emit(Inst::ToDyn {
+            dst: r,
+            src: out,
+            from: BPrim::Str,
+        });
+        self.fx.release_window(range.0, range.1);
+        for x in [out, one, t, z, n, i, s] {
+            self.fx.release(x);
+        }
+    }
+
+    /// `dst = obj[key]`, routing a string `obj` through the
+    /// [`string_offsets`](crate::Options::string_offsets) intrinsic when one
+    /// is set.
+    pub(crate) fn index_read(&mut self, dst: Reg, obj: Reg, key: Reg) {
+        let def = self
+            .cx
+            .opts
+            .string_offsets()
+            .and_then(|n| self.cx.opts.intrinsics().get(n))
+            .map(|d| d.lowering().clone());
+        let Some(lowering) = def else {
+            self.emit(Inst::DGetIndex { dst, obj, key });
+            return;
+        };
+        let (other, done) = (self.label(), self.label());
+        let b = self.fx.temp(ValType::Bool);
+        self.emit(Inst::IsKind {
+            dst: b,
+            src: obj,
+            kind: Kind::Str,
+        });
+        self.jump_on(b, other, false);
+        self.fx.release(b);
+        match &lowering {
+            Lowering::Lsb(op) => {
+                let op = *op;
+                let vals = [
+                    Val {
+                        reg: obj,
+                        rel: super::Rel::Keep,
+                    },
+                    Val {
+                        reg: key,
+                        rel: super::Rel::Keep,
+                    },
+                ];
+                self.lsb_op(op, &vals, dst);
+            }
+            Lowering::Host { module, name } | Lowering::Fast { module, name, .. } => {
+                let fast = match &lowering {
+                    Lowering::Fast { fast, .. } => Some(*fast),
+                    _ => None,
+                };
+                let import = self.cx.import(module, name, 2);
+                let win = self.fx.window(&[ValType::Dyn, ValType::Dyn, ValType::Dyn]);
+                let (a1, a2) = (FnCx::slot(win.1, 1), FnCx::slot(win.1, 2));
+                self.emit(Inst::Mov { dst: a1, src: obj });
+                self.emit(Inst::Mov { dst: a2, src: key });
+                let (slow, end) = (self.label(), self.label());
+                if let Some(f) = fast {
+                    self.fast_path(f, &[a1, a2], dst, slow);
+                    self.jmp(end);
+                }
+                self.bind(slow);
+                self.emit(Inst::CallImport {
+                    dst: win.1,
+                    import,
+                    argc: 2,
+                });
+                self.emit(Inst::Mov { dst, src: win.1 });
+                self.bind(end);
+                self.fx.release_window(win.0, win.1);
+            }
+            // Refused when the options are checked.
+            _ => self.emit(Inst::DGetIndex { dst, obj, key }),
+        }
+        self.jmp(done);
+        self.bind(other);
+        self.emit(Inst::DGetIndex { dst, obj, key });
+        self.bind(done);
     }
 
     /// Every part a `str`: one `str_concat_n` over unboxed copies.
@@ -692,6 +865,9 @@ impl<L: Lookup> Gen<'_, '_, L> {
 
     /// `(int)` or `(float)` of a number, a `bool`, or nil.
     fn fast_to_number(&mut self, float: bool, a: Reg, r: Reg, slow: Label) {
+        if !float {
+            return self.fast_to_int(a, r, slow);
+        }
         let t = self.fx.temp(ValType::Bool);
         let (own, other, boolean, nil, done) = (
             self.label(),
@@ -778,6 +954,210 @@ impl<L: Lookup> Gen<'_, '_, L> {
         self.bind(done);
         self.fx.release(i);
         self.fx.release(t);
+    }
+
+    /// `(int)` of an `int`, a `bool`, nil, or a `float` by PHP's
+    /// `zend_dval_to_lval` (64-bit): truncation toward zero in
+    /// `[-2^63, 2^63)`, 0 for NaN and the infinities, and modulo 2^64 into
+    /// the signed range for every other finite value (ISSUES P41).
+    fn fast_to_int(&mut self, a: Reg, r: Reg, slow: Label) {
+        let t = self.fx.temp(ValType::Bool);
+        let (own, flt, boolean, nil, done) = (
+            self.label(),
+            self.label(),
+            self.label(),
+            self.label(),
+            self.label(),
+        );
+        for (kind, l) in [
+            (Kind::Int, own),
+            (Kind::Float, flt),
+            (Kind::Bool, boolean),
+            (Kind::Nil, nil),
+        ] {
+            self.emit(Inst::IsKind {
+                dst: t,
+                src: a,
+                kind,
+            });
+            self.jump_on(t, l, true);
+        }
+        self.jmp(slow);
+        self.bind(own);
+        self.emit(Inst::Mov { dst: r, src: a });
+        self.jmp(done);
+        let i = self.fx.temp(ValType::I64);
+        self.bind(boolean);
+        self.emit(Inst::FromDyn {
+            dst: t,
+            src: a,
+            to: BPrim::Bool,
+        });
+        self.emit(Inst::BoolToInt {
+            dst: i,
+            src: t,
+            ty: IntTy::I64,
+        });
+        self.emit(Inst::ToDyn {
+            dst: r,
+            src: i,
+            from: BPrim::I64,
+        });
+        self.jmp(done);
+        self.bind(nil);
+        self.emit(Inst::DLoadInt { dst: r, val: 0 });
+        self.jmp(done);
+        self.bind(flt);
+        self.float_to_lval(a, i);
+        self.emit(Inst::ToDyn {
+            dst: r,
+            src: i,
+            from: BPrim::I64,
+        });
+        self.bind(done);
+        self.fx.release(i);
+        self.fx.release(t);
+    }
+
+    /// `i` = `zend_dval_to_lval` of the dynamic float in `a`. In range it is
+    /// `f64_to_int` (saturating, NaN 0); out of range a finite value is an
+    /// integer `m * 2^e` with `e >= 11`, so its value modulo 2^64 is the
+    /// 53-bit significand shifted left by `e` (0 from `e = 64` on), negated
+    /// for a negative value: computed on the IEEE bits with wrapping integer
+    /// arithmetic.
+    fn float_to_lval(&mut self, a: Reg, i: Reg) {
+        let f = self.fx.temp(ValType::F64);
+        let lim = self.fx.temp(ValType::F64);
+        let t = self.fx.temp(ValType::Bool);
+        let (out, done) = (self.label(), self.label());
+        self.emit(Inst::FromDyn {
+            dst: f,
+            src: a,
+            to: BPrim::F64,
+        });
+        // In [-2^63, 2^63): truncation (NaN fails both tests below and is
+        // handled by the saturating conversion: 0).
+        let k = self.cx.mb.constant(Const::f64(9_223_372_036_854_775_808.0));
+        self.emit(Inst::LoadConst { dst: lim, k });
+        self.emit(Inst::FGe {
+            dst: t,
+            lhs: f,
+            rhs: lim,
+            ty: bytecode_lang::FloatTy::F64,
+        });
+        self.jump_on(t, out, true);
+        let k = self
+            .cx
+            .mb
+            .constant(Const::f64(-9_223_372_036_854_775_808.0));
+        self.emit(Inst::LoadConst { dst: lim, k });
+        self.emit(Inst::FLt {
+            dst: t,
+            lhs: f,
+            rhs: lim,
+            ty: bytecode_lang::FloatTy::F64,
+        });
+        self.jump_on(t, out, true);
+        self.emit(Inst::F64ToInt {
+            dst: i,
+            src: f,
+            conv: bytecode_lang::FloatConv::new(IntTy::I64)
+                .with_float_to_int(bytecode_lang::FloatToInt::Saturate),
+        });
+        self.jmp(done);
+        self.bind(out);
+        let bits = self.fx.temp(ValType::I64);
+        let e = self.fx.temp(ValType::I64);
+        let c = self.fx.temp(ValType::I64);
+        let wrap = bytecode_lang::IntOp::new(IntTy::I64)
+            .with_policy(Policy::new().with_overflow(Overflow::Wrap));
+        let mask = bytecode_lang::IntOp::new(IntTy::I64)
+            .with_policy(Policy::new().with_shift(Shift::Mask));
+        self.emit(Inst::FloatToBits {
+            dst: bits,
+            src: f,
+            ty: IntTy::I64,
+        });
+        // The biased exponent; 0x7FF is an infinity or NaN: 0.
+        self.load_i64(c, 52);
+        self.emit(Inst::IShr {
+            dst: e,
+            lhs: bits,
+            rhs: c,
+            op: mask,
+        });
+        self.load_i64(c, 0x7FF);
+        self.emit(Inst::IAnd {
+            dst: e,
+            lhs: e,
+            rhs: c,
+            op: wrap,
+        });
+        self.load_i64(i, 0);
+        self.emit(Inst::IEq {
+            dst: t,
+            lhs: e,
+            rhs: c,
+            ty: IntTy::I64,
+        });
+        self.jump_on(t, done, true);
+        // The shift: e - 1075 (the significand's units are 2^(e-1075));
+        // from 64 on, every bit is shifted out.
+        self.load_i64(c, 1075);
+        self.emit(Inst::ISub {
+            dst: e,
+            lhs: e,
+            rhs: c,
+            op: wrap,
+        });
+        self.load_i64(c, 64);
+        self.emit(Inst::IGe {
+            dst: t,
+            lhs: e,
+            rhs: c,
+            ty: IntTy::I64,
+        });
+        self.jump_on(t, done, true);
+        // The significand with its implicit bit.
+        let m = self.fx.temp(ValType::I64);
+        self.load_i64(c, (1i64 << 52) - 1);
+        self.emit(Inst::IAnd {
+            dst: m,
+            lhs: bits,
+            rhs: c,
+            op: wrap,
+        });
+        self.load_i64(c, 1i64 << 52);
+        self.emit(Inst::IOr {
+            dst: m,
+            lhs: m,
+            rhs: c,
+            op: wrap,
+        });
+        self.emit(Inst::IShl {
+            dst: i,
+            lhs: m,
+            rhs: e,
+            op: mask,
+        });
+        // Negative: the wrapping negation.
+        self.load_i64(c, 0);
+        self.emit(Inst::ILt {
+            dst: t,
+            lhs: bits,
+            rhs: c,
+            ty: IntTy::I64,
+        });
+        self.jump_on(t, done, false);
+        self.emit(Inst::INeg {
+            dst: i,
+            src: i,
+            op: wrap,
+        });
+        self.bind(done);
+        for x in [m, c, e, bits, t, lim, f] {
+            self.fx.release(x);
+        }
     }
 
     /// `r` = the `i64` in `i` as a dynamic float.
