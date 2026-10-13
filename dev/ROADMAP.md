@@ -171,6 +171,23 @@ Known deviations and gaps (each a precise behaviour, none a crash):
 - **LSB verifier**: still bytecode-lang 0.5; every emitted module is checked
   by bvm-lang's load-time checks.
 
+## v0.4.1 - Initializers of a nested module (DONE, 2026-10-13)
+Patch release, found by the LexerSketch Demo (Mox `namespace A; class S {
+const C = [1]; } echo count(S::C);` gave `null`).
+- [x] The start function runs every initializer before any nested module's
+  body (it ran a body at its module's position, ahead of the initializers of
+  the declarations inside it).
+
+Delivered:
+- `src/analysis.rs`: a stable partition of the start function's initializer
+  order (declarations, then module bodies; linear). No API change.
+- Proof: `tests/nested_modules.rs` (5 programs x both body modes; 4 failed on
+  0.4.0), `H::module` in `tests/common/hb.rs`; checked end to end through the
+  LexerSketch `lsk` (class constants, static properties, enum cases, a
+  namespace constant, `namespace A\B;`, and braced namespaces).
+
+Dependency wiring: unchanged from v0.4.0.
+
 ## v0.4.0 - Classes (DONE, 2026-10-12)
 Mox needs classes for the LexerSketch Demo, so they moved here from v0.5
 (recorded under "Moved" below, per the anti-deferral rule).

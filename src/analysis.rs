@@ -122,6 +122,19 @@ impl Analysis {
                 a.mark_global(hir, hir.path(p).res);
             }
         }
+        // The walk is pre-order, so a nested module's entry precedes the
+        // declarations inside it (and those of the modules after it). Its
+        // body is code that reads them, so it must run after every
+        // initializer, not at the module's own position: otherwise
+        // `namespace A; class S { const C = [1]; } echo S::C;` reads the
+        // constant before the start function computes it. A stable partition
+        // (linear) keeps each group in canonical order.
+        let (decls, bodies): (Vec<ItemId>, Vec<ItemId>) = a
+            .inits
+            .iter()
+            .partition(|&&id| !matches!(hir.item(id).kind, ItemKind::Module { body: Some(_), .. }));
+        a.inits = decls;
+        a.inits.extend(bodies);
         a
     }
 

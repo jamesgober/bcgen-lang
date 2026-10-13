@@ -466,6 +466,21 @@ impl H {
         self.b.binder(Binder::new(n, BinderKind::Capture))
     }
 
+    /// A nested module (a lowered `namespace`), with items and a body.
+    pub fn module(&mut self, name: &str, items: &[ItemId], body: Option<ExprId>) -> ItemId {
+        self.tick();
+        let n = self.name(name);
+        let items = self.b.list(items);
+        self.b.item(Item::new(
+            Some(n),
+            ItemKind::Module {
+                items,
+                body,
+                effects: Effects::THROWS,
+            },
+        ))
+    }
+
     /// The root module, with items and a body; finishes the unit.
     pub fn finish(mut self, items: &[ItemId], body: Option<ExprId>) -> (Hir, Interner) {
         self.tick();

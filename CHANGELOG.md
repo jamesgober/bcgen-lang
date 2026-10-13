@@ -13,6 +13,38 @@
 
 ---
 
+## [0.4.1] - 2026-10-13
+
+**Patch: initializers of a nested module.** A computed class constant or
+static property, an enum case, and a computed module constant or global
+declared inside a nested module (a lowered `namespace`) were still `null`
+when the module's own body read them. Found through the LexerSketch Demo
+(Mox `namespace A; class S { const C = [1]; } echo count(S::C);` printed
+nothing useful; the same code without the `namespace` worked). No API change.
+
+### Fixed
+
+- **The start function ran a nested module's body before the initializers of
+  the declarations inside it.** It walked the unit's items in pre-order and
+  ran each module's body at the module's own position, ahead of the classes,
+  constants, and globals declared in it (and of those of the modules after
+  it). A body that read a computed value saw it uninitialized; literal
+  initializers were unaffected because LSB constant initializers need no
+  code. Every initializer now runs first, in canonical order, and then the
+  nested module bodies, in canonical order (`src/analysis.rs`). A unit
+  without a nested module compiles to the same bytes as before.
+
+### Added
+
+- `tests/nested_modules.rs`: five programs, each in both body modes
+  (`BodyMode::Start` and `BodyMode::Entry`): the root control, a class
+  constant and static property in a namespace, a namespace constant and
+  global, a doubly nested namespace, and a body reading a later sibling
+  namespace's constant. Four of them failed on 0.4.0.
+- `tests/common/hb.rs`: `H::module`, a nested module item.
+
+---
+
 ## [0.4.0] - 2026-10-12
 
 **Classes.** HIR's classes, interfaces, and mixins (PHP traits) compile to
@@ -296,7 +328,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/bcgen-lang/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bcgen-lang/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/jamesgober/bcgen-lang/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jamesgober/bcgen-lang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/bcgen-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/bcgen-lang/compare/v0.1.0...v0.2.0

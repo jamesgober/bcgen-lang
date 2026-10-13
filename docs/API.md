@@ -2,7 +2,7 @@
 
 > Complete reference for every public item in `bcgen-lang`, with examples, and
 > the dynamic semantics the compiled code implements.
-> **Status: 0.4.0, pre-1.0.** The surface may change across the 0.x series; it
+> **Status: 0.4.1, pre-1.0.** The surface may change across the 0.x series; it
 > freezes at 1.0 after the LexerSketch Demo runs Mox through it. See
 > [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
@@ -150,7 +150,7 @@ LSB cannot hold or PHP rejects is a [`ClassProblem`](#classproblem).
 A parameter is `dyn`, or `ref cell dyn` (a reference, LSB §5.17) when it is
 by reference. Globals: one per global and constant item (literal
 initializers become LSB constant initializers; others are computed by
-`<start>` in canonical order), one per `static` statement (plus an
+`<start>` in canonical order, before any nested module's body), one per `static` statement (plus an
 initialized flag), one per once-evaluated default, and `<result>` for the
 body's value in `BodyMode::Start`. Imports: one per host symbol and argument
 count, `(dyn × n) -> dyn`, module and name split at the symbol's last `.`
@@ -631,6 +631,10 @@ accessor, which returns the reference. A constant is a global per (class,
 constant): a literal is an LSB constant initializer, anything else is
 computed by the start function in the class's scope, classes in canonical
 order. Interface constants are reachable through every implementing class.
+The start function runs every initializer (globals, constants, classes, in
+canonical order, wherever they are nested) first and then the nested modules'
+bodies (0.4.1; 0.4.0 ran a body at its module's position, so a `namespace`
+body read its own computed constants before they were set).
 A member a class does not have raises PHP's error where the access runs
 ("Call to undefined method C::m()", "Undefined constant C::X", "Access to
 undeclared static property C::$x").
