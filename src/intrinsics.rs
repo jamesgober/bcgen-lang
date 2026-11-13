@@ -1,4 +1,4 @@
-//! The intrinsic table (LexerSketch decision D27): how each named intrinsic
+//! The intrinsic table (decision D27): how each named intrinsic
 //! (`Intrinsic::Named` in HIR) compiles.
 //!
 //! A language's lowering turns operators whose semantics are not OPS
@@ -583,7 +583,7 @@ impl Intrinsics {
     }
 
     /// [`core`](Intrinsics::core) plus every intrinsic of the Mox sketch
-    /// (`_lexersketch/sketches/mox.lsf`), each a [`Fast`] path over the host
+    /// (the Mox sketch), each a [`Fast`] path over the host
     /// function `mox`.`<name>` where one is exact, a [`ClassOp`] over it for
     /// `mox.instanceof` and `mox.clone`, else the host function alone
     /// (`mox.cast_object`); plus `mox.new` (the sketch's `new_object`

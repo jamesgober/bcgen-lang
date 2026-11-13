@@ -3,7 +3,7 @@
 > Complete reference for every public item in `bcgen-lang`, with examples, and
 > the dynamic semantics the compiled code implements.
 > **Status: 0.4.1, pre-1.0.** The surface may change across the 0.x series; it
-> freezes at 1.0 after the LexerSketch Demo runs Mox through it. See
+> freezes at 1.0 after the toolchain demo runs Mox through it. See
 > [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
@@ -62,7 +62,7 @@
 HIR spec v3) to an LSB module (`bytecode_lang::Module`, bytecode-lang 0.3,
 **LSB format version 2**) that `bvm-lang` 2.0 (`2.0.0-alpha.4`) loads and
 runs. It compiles the **dynamic profile**: every value is an LSB `dyn`. It is
-the bridge LexerSketch decision D19 calls for: HIR to LSB directly, keeping
+the bridge decision D19 calls for: HIR to LSB directly, keeping
 the structure (closures, maps, dynamic values, exceptions, coroutines) that
 both representations have first-class.
 
@@ -481,9 +481,9 @@ table of the [`Options`](#options): the name must be in the table
 ### The Mox intrinsics
 
 [`Intrinsics::mox`](#intrinsics) is `core` plus every intrinsic of the Mox
-sketch (`_lexersketch/sketches/mox.lsf`). Each is a fast path over the host
+sketch (the Mox sketch). Each is a fast path over the host
 function `mox`.`<name>` where one is exact, else the host function alone.
-"Host" below is what LexerSketch's runtime (ls-exec) must implement: **PHP
+"Host" below is what the toolchain's runtime (ls-exec) must implement: **PHP
 8's semantics of the operator for every input** (the column states what PHP
 does; the fast path computes exactly that on its domain). Errors are raised
 by the host function as `bvm_lang::HostError::Raise(kind)` with the kind
@@ -544,7 +544,7 @@ place chain) through an entry of the intrinsic table, called with the string
 and the coerced key; other bases keep `dget_index`. Writes to a string offset
 are unchanged (LSB strings are immutable: the `set_index` hook decides).
 
-**How LexerSketch uses it:** compile Mox with
+**How the toolchain uses it:** compile Mox with
 
 ```rust
 use bcgen_lang::{Intrinsics, Options};
@@ -1017,7 +1017,7 @@ impl Intrinsics {
 }
 ```
 
-The intrinsic table (LexerSketch decision D27): each name's arity and
+The intrinsic table (decision D27): each name's arity and
 [lowering](#lowering). A later entry of a name replaces an earlier one. The
 semantics of `core` and `mox` are in [Named intrinsics](#named-intrinsics)
 and [The Mox intrinsics](#the-mox-intrinsics).

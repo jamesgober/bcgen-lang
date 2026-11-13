@@ -1,6 +1,6 @@
 //! # bcgen_lang
 //!
-//! Compiles HIR (the representation every LexerSketch language lowers into)
+//! Compiles HIR (the representation every forged language lowers into)
 //! to LSB, the bytecode `bvm-lang` executes.
 //!
 //! ## The lazy path

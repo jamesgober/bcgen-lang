@@ -19,7 +19,7 @@ readme = "README.md"
 description = "Compiles HIR to LSB bytecode: the path from a forged language's meaning to code bvm-lang runs."
 
 # Keywords (5 max)
-keywords = ["bytecode", "compiler", "hir", "codegen", "lexersketch"]
+keywords = ["bytecode", "compiler", "hir", "codegen"]
 
 # Categories
 categories = ["compilers", "no-std"]
@@ -69,7 +69,7 @@ proptest  = "1"
 # Executes what the compiler emits: the differential, end-to-end, and load tests
 # (alpha.4: the reference-counting memory profile and `Vm::set_destructor`).
 bvm-lang = "=2.0.0-alpha.4"
-# Resolves the end-to-end programs (the PHP policy), as the LexerSketch chain does.
+# Resolves the end-to-end programs (the PHP policy), as the toolchain's chain does.
 resolve-lang = "0.4"
 
 

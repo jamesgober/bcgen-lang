@@ -18,7 +18,7 @@
 **Patch: initializers of a nested module.** A computed class constant or
 static property, an enum case, and a computed module constant or global
 declared inside a nested module (a lowered `namespace`) were still `null`
-when the module's own body read them. Found through the LexerSketch Demo
+when the module's own body read them. Found through the toolchain demo
 (Mox `namespace A; class S { const C = [1]; } echo count(S::C);` printed
 nothing useful; the same code without the `namespace` worked). No API change.
 
@@ -49,7 +49,7 @@ nothing useful; the same code without the `namespace` worked). No API change.
 
 **Classes.** HIR's classes, interfaces, and mixins (PHP traits) compile to
 LSB structs (LSB §3.1) with PHP 8's semantics, pulled forward from the 0.5
-plan because Mox needs them for the LexerSketch Demo. Also: PHP's ignored
+plan because Mox needs them for the toolchain demo. Also: PHP's ignored
 extra arguments, Mox's `(int)` of an out-of-range float, string offsets
 through a named intrinsic, and resolve-lang back in the end-to-end tests.
 Executes on bvm-lang `=2.0.0-alpha.4`.
@@ -132,7 +132,7 @@ Executes on bvm-lang `=2.0.0-alpha.4`.
 
 HIR spec v3 (hir-lang 0.4) to **LSB format 2** (bytecode-lang 0.3), which
 bvm-lang 2.0.0-alpha.3 executes, with the named intrinsics Mox needs. This
-release unblocks the LexerSketch Demo chain (lang-forge → lower-lang →
+release unblocks the toolchain demo chain (lang-forge → lower-lang →
 resolve-lang → typeck-lang → bcgen-lang → bvm-lang): it is on the hir-lang
 version typeck-lang 0.3 uses, emits the bytecode format the VM reads, and
 compiles every intrinsic of the Mox sketch.

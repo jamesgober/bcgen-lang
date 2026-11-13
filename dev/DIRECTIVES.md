@@ -1,13 +1,12 @@
 # bcgen-lang &mdash; Engineering Directives
 
 > Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative) and `dev/ROADMAP.md` (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins.
-> Family plan: `../_lexersketch/` (README rules of engagement, ARCHITECTURE, ISSUES, ROADMAP).
 
 ---
 
 ## 0. Philosophy
 
-This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is part of the LexerSketch runtime tier (LXRT) of the `-lang` family that LexerSketch assembles.
+This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is part of the toolchain's runtime tier (LXRT) of the `-lang` family that the toolchain assembles.
 
 ---
 
@@ -15,7 +14,7 @@ This library is built and maintained to a production standard and treated as a f
 
 bcgen-lang owns the HIR to LSB translation: register allocation over LSB's register windows, closure conversion and capture layout, pattern-match compilation via match-lang decision trees, exception and finally lowering per LSB's canonical scheme, coroutine frames, and debug line tables mapping every instruction back to its HIR origin. It does not parse, resolve, type-check, or execute.
 
-It is the bridge that makes the Demo, the REPL, and hybrid bytecode units real (LexerSketch decision D19), and it is shared by every forged language.
+It is the bridge that makes the Demo, the REPL, and hybrid bytecode units real (decision D19), and it is shared by every forged language.
 
 ---
 
@@ -42,7 +41,7 @@ It is the bridge that makes the Demo, the REPL, and hybrid bytecode units real (
 6. Property tests cover every section-4 invariant; a fuzz target exists for every decoder or parser.
 7. Hot-path changes carry benchmarks; no regression over 5%.
 8. `README.md`, `docs/API.md`, and `CHANGELOG.md` updated; the matching `docs/release/vX.Y.Z.md` written before the tag.
-9. v1.0.0 only after a real consumer has exercised the API end to end (LexerSketch decision D18).
+9. v1.0.0 only after a real consumer has exercised the API end to end (decision D18).
 
 ---
 

@@ -1,7 +1,6 @@
 # bcgen-lang - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: ../_lexersketch/ROADMAP.md and ../_lexersketch/NEW-LIBS.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -74,7 +73,7 @@ Moved, or not possible on LSB 1 (with the reason):
   every module is checked by bvm-lang's load-time checks.
 
 ## v0.3.0 - HIR 0.4, LSB v2, intrinsics (DONE, 2026-10-12)
-Unblocks the LexerSketch Demo chain (lang-forge → lower-lang → resolve-lang →
+Unblocks the toolchain demo chain (lang-forge → lower-lang → resolve-lang →
 typeck-lang → bcgen-lang → bvm-lang): the hir-lang version typeck-lang 0.3
 uses, the LSB format bvm-lang 2.0.0-alpha.3 reads, and the Mox intrinsics.
 - [x] hir-lang 0.4 (HIR spec v3): keyed `yield`, `yield from`, `let_place`,
@@ -172,7 +171,7 @@ Known deviations and gaps (each a precise behaviour, none a crash):
   by bvm-lang's load-time checks.
 
 ## v0.4.1 - Initializers of a nested module (DONE, 2026-10-13)
-Patch release, found by the LexerSketch Demo (Mox `namespace A; class S {
+Patch release, found by the toolchain demo (Mox `namespace A; class S {
 const C = [1]; } echo count(S::C);` gave `null`).
 - [x] The start function runs every initializer before any nested module's
   body (it ran a body at its module's position, ahead of the initializers of
@@ -183,13 +182,13 @@ Delivered:
   order (declarations, then module bodies; linear). No API change.
 - Proof: `tests/nested_modules.rs` (5 programs x both body modes; 4 failed on
   0.4.0), `H::module` in `tests/common/hb.rs`; checked end to end through the
-  LexerSketch `lsk` (class constants, static properties, enum cases, a
+  toolchain `lsk` (class constants, static properties, enum cases, a
   namespace constant, `namespace A\B;`, and braced namespaces).
 
 Dependency wiring: unchanged from v0.4.0.
 
 ## v0.4.0 - Classes (DONE, 2026-10-12)
-Mox needs classes for the LexerSketch Demo, so they moved here from v0.5
+Mox needs classes for the toolchain demo, so they moved here from v0.5
 (recorded under "Moved" below, per the anti-deferral rule).
 - [x] Classes, objects, and interfaces from HIR: inheritance, interfaces as
   type tests, mixins (PHP traits); `new` with constructors; instance
@@ -203,7 +202,7 @@ Mox needs classes for the LexerSketch Demo, so they moved here from v0.5
 - [x] Mox `(int)` of an out-of-range finite float wraps modulo 2^64 like
   `zend_dval_to_lval`; NaN and infinities give 0 (ISSUES P41).
 - [x] String-offset reads through a named intrinsic (ISSUES P38), with how
-  LexerSketch uses it (`docs/API.md`, "String offsets").
+  the toolchain uses it (`docs/API.md`, "String offsets").
 
 Delivered:
 - `ClassOp` (`New`, `InstanceOf`, `Clone`; `arity`), `Intrinsics::with_class`,
@@ -307,7 +306,7 @@ functions are generated per scope over every member name of the unit
 - [ ] (From 0.4) Mox instance methods end to end through lower-lang once it emits receivers (`implicit_receiver`); the Mox `new_object` template through resolve-lang once it accepts a class in value position; `final` enforcement, `readonly`, and constructor promotion if HIR gains the markers; a destructor flag if LSB gains one (P44).
 
 ## v0.9.0 - Hardening
-- [ ] Differential fuzzing; scale benchmarks; audit with the LexerSketch Demo as the consumer.
+- [ ] Differential fuzzing; scale benchmarks; audit with the toolchain demo as the consumer.
 
 ## v1.0.0 - Stable
-- [ ] Frozen after Mox runs through it in the LexerSketch Demo (D18).
+- [ ] Frozen after Mox runs through it in the toolchain demo (D18).
