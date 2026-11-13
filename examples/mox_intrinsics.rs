@@ -3,7 +3,7 @@
 //! `Intrinsics::mox()` compiles each to an inline fast path where LSB's
 //! semantics are PHP's (two ints, two strings, ...) and to a call of the
 //! runtime's host function everywhere else. The host functions here are
-//! small stand-ins for LexerSketch's runtime that print when they run.
+//! small stand-ins for the toolchain's runtime that print when they run.
 //!
 //! The program, in Mox source:
 //!

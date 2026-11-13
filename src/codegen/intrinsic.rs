@@ -1,6 +1,6 @@
 //! Named intrinsics, compiled through the [`Intrinsics`](crate::Intrinsics)
 //! table: an LSB sequence, a host call, or a guarded fast path over a host
-//! call (LexerSketch decision D27).
+//! call (decision D27).
 //!
 //! A fast path evaluates the operands straight into the host call's window,
 //! tests their kinds, and runs the inline sequence where it computes exactly
